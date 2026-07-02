@@ -1,8 +1,9 @@
 # Oblikovati.AddIns.Elmer — Elmer multiphysics FEA add-in (port design)
 
 Date: 2026-07-02
-Status: DRAFT — awaiting user review (decisions below were taken with recommended
-defaults while the user was away; each is flagged and reversible before planning)
+Status: ACCEPTED — M0/MV/M1 built and merged against this design; §15's open questions
+are answered below. Decisions D1-D6 stood as taken; D3 (mesh handoff) and D6 (result
+decode) are additionally pinned by ADR-0001 with the load-bearing details M1 surfaced.
 
 ## 1. Goal
 
@@ -248,10 +249,25 @@ committed docs/filenames); upstream mapping notes live untracked at
 `SPDX-License-Identifier: GPL-2.0-only`. Never re-declare wire DTOs; host access
 only via `api/client`. Close issues on PR merge; no `git add -A`.
 
-## 15. Open questions for the user (blocking nothing in M0/MV)
+## 15. Open questions for the user — ANSWERED
 
-1. Confirm D1 milestone order — or pull M3/M4 (flow/magnetics) even earlier?
-2. Confirm D3 (native mesh writer over ElmerGrid conversion).
-3. Ribbon placement: own "Elmer" tab next to the FEA tab, or shared FEA tab with an
-   Elmer panel group?
-4. Which elmerfem release to vendor (latest stable 9.x assumed).
+1. **Milestone order (D1):** confirmed as taken — M1 elasticity (easy-oracle pipeline
+   proof) landed first, gap physics (flow M3, magnetodynamics M4) stay after the scalar-
+   field family (M2), no pull-forward requested.
+2. **Native mesh writer (D3):** confirmed — Elmer's native mesh database
+   (`mesh.header`/`mesh.nodes`/`mesh.elements`/`mesh.boundary`) is written directly by
+   `elmer/meshfmt`, with add-in-owned body/boundary ids. `ElmerGrid` is vendored anyway
+   (ships in the same upstream source tree) and kept strictly as a debug/oracle tool, not
+   a runtime dependency. Full rationale: ADR-0001 D1.
+3. **Ribbon placement: SUPERSEDED by user directive (2026-07-02).** Not the "shared FEA
+   tab" option this question floated — Elmer gets its own dedicated **"Elmer" ribbon
+   tab**, on both the Part and Assembly ribbons, mirroring
+   `Oblikovati.AddIns.CAM`'s dedicated "CAM" tab precedent. Implemented via two command
+   registrations per action (`Elmer.RunStudy` / `Elmer.RunStudy.Assembly`, etc.) since
+   the wire contract has no multi-ribbon registration primitive. Full rationale:
+   ADR-0001 D8.
+4. **elmerfem release to vendor:** **release-26.2** (tag `release-26.2`, commit
+   `43b44cf`) — the newest `release-*` tag as of vendoring (MV), not a numbered "9.x"
+   GitHub Release (elmerfem doesn't publish one; confirmed via
+   `gh api repos/ElmerCSC/elmerfem/releases/latest` resolving to this tag). Provenance
+   and source-archive SHA-256 recorded in `vendor-src/elmer/NOTICE.md`.
