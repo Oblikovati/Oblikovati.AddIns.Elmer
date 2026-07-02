@@ -131,10 +131,15 @@ jobs:
       - uses: ./.github/actions/siblings
       - name: Install build toolchain
         run: sudo apt-get update && sudo apt-get install -y gfortran cmake
-      # gmsh is the long pole cold (~20+ min); ElmerSolver+lapack is ~3-4 min. Cache both
-      # build trees keyed on their vendored source content so unchanged pushes to this
-      # branch skip most of the compile (build.sh reruns cmake --build, which is
-      # incremental against a warm cache).
+      # gmsh is the long pole cold (~7 min on the runner); ElmerSolver+lapack is ~8 min.
+      # Cache both build trees keyed on the exact content hash of their vendored sources,
+      # and on an exact-key hit SKIP that tool's build step entirely: a hit proves the
+      # cached binaries were built from byte-identical sources, and "rerun cmake --build
+      # incrementally against the warm tree" does NOT work — actions/checkout writes the
+      # sources with fresh mtimes, newer than the restored object files, so make recompiles
+      # everything (measured on run 28612820567: warm rebuilt 1523/1524 objects, same ~15
+      # min as cold). The cube smoke below still executes the (restored or fresh)
+      # ElmerSolver on every run, so a corrupt cache cannot pass silently.
       #
       # Split restore/save (rather than the combined actions/cache@v4 action): the combined
       # action saves on job end unconditionally, including when the build step fails — that
@@ -157,9 +162,16 @@ jobs:
             vendor-src/elmer/build
             vendor-src/elmer/install
           key: elmer-build-${{ runner.os }}-${{ hashFiles('vendor-src/elmer/**') }}
-      - name: Build vendored gmsh + ElmerSolver
-        id: build-solvers
-        run: make build-solvers
+      # These two steps are `make build-solvers` split per tool so each half can be
+      # skipped independently on its own exact-key cache hit (see the comment above).
+      - name: Build vendored gmsh
+        id: build-gmsh
+        if: steps.restore-gmsh-cache.outputs.cache-hit != 'true'
+        run: vendor-src/gmsh/build.sh
+      - name: Build vendored ElmerSolver
+        id: build-elmer
+        if: steps.restore-elmer-cache.outputs.cache-hit != 'true'
+        run: vendor-src/elmer/build.sh
       - name: Validate ElmerSolver solves the 5-tet cube (peak w must equal 1.0e-3 m)
         run: vendor-src/elmer/test/run.sh
       # Tag-gated oracle tests land in Task 13 (analytic solutions driven through the real
@@ -170,13 +182,13 @@ jobs:
           OBK_GMSH_BIN: ${{ github.workspace }}/vendor-src/gmsh/build/gmsh
         run: go test ./... -tags solvers
       - name: Save vendored gmsh build cache
-        if: steps.build-solvers.outcome == 'success' && steps.restore-gmsh-cache.outputs.cache-hit != 'true'
+        if: steps.build-gmsh.outcome == 'success' && steps.restore-gmsh-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: vendor-src/gmsh/build
           key: ${{ steps.restore-gmsh-cache.outputs.cache-primary-key }}
       - name: Save vendored ElmerSolver build cache
-        if: steps.build-solvers.outcome == 'success' && steps.restore-elmer-cache.outputs.cache-hit != 'true'
+        if: steps.build-elmer.outcome == 'success' && steps.restore-elmer-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
