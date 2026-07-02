@@ -164,6 +164,38 @@ func TestNaNCheckPassesOnCleanResult(t *testing.T) {
 	}
 }
 
+// TestReadFileMissingPointsBlockErrors pins the missing-Points guard: a well-formed VTU
+// with a PointData block but no <Points> element at all (a truncated/crashed-solver
+// write) must error naming the missing Points block rather than silently returning a
+// Result with Points: nil, nil error — see the finding this regression-tests: with no
+// <Points> element, pointsXML.Array is the zero value, parseAsciiArray("") yields an
+// empty slice, 0%3==0 passes, and the old code returned a bogus empty-but-"successful"
+// Result even though the Piece declares NumberOfPoints=4.
+func TestReadFileMissingPointsBlockErrors(t *testing.T) {
+	_, err := ReadFile("testdata/no_points.vtu")
+	if err == nil {
+		t.Fatal("ReadFile(no_points.vtu): want an error, got nil")
+	}
+	if !containsAll(err.Error(), "Points", "no_points.vtu") {
+		t.Errorf("error %q should name the missing Points block and the file", err)
+	}
+}
+
+// TestReadFileTruncatedFieldErrors pins the field-shape guard: a "displacement" DataArray
+// declaring NumberOfComponents=3 over a 4-point Piece must carry exactly 12 values (3
+// comps x 4 points); truncated_field.vtu carries only 11, simulating a crashed-solver
+// write that must not be silently misattributed to fewer points or fewer components, nor
+// let a caller index past the end of the slice.
+func TestReadFileTruncatedFieldErrors(t *testing.T) {
+	_, err := ReadFile("testdata/truncated_field.vtu")
+	if err == nil {
+		t.Fatal("ReadFile(truncated_field.vtu): want an error, got nil")
+	}
+	if !containsAll(err.Error(), "displacement", "11", "12") {
+		t.Errorf("error %q should name the field and the got/want value counts", err)
+	}
+}
+
 // containsAll reports whether s contains every one of wants, for assembling one multi-part
 // assertion instead of chained single-substring checks.
 func containsAll(s string, wants ...string) bool {

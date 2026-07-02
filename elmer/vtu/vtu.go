@@ -49,8 +49,9 @@ type unstructuredGridXML struct {
 // CellData/Cells are parsed by nothing here — this add-in's M1 slice only renders
 // point-sampled fields (ADR-0001's ASCII-only, no-mesh-topology-reuse scope).
 type pieceXML struct {
-	PointData pointDataXML `xml:"PointData"`
-	Points    pointsXML    `xml:"Points"`
+	NumberOfPoints int          `xml:"NumberOfPoints,attr"`
+	PointData      pointDataXML `xml:"PointData"`
+	Points         pointsXML    `xml:"Points"`
 }
 
 type pointDataXML struct {
@@ -90,17 +91,21 @@ func ReadFile(path string) (*Result, error) {
 	if err := xml.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("vtu: parse %s as VTU XML: %w", path, err)
 	}
-	return resultFrom(doc.Grid.Piece)
+	res, err := resultFrom(doc.Grid.Piece)
+	if err != nil {
+		return nil, fmt.Errorf("vtu: %s: %w", path, err)
+	}
+	return res, nil
 }
 
 // resultFrom converts one parsed <Piece> into a Result, surfacing the first parse error
 // from either the Points array or any PointData field.
 func resultFrom(p pieceXML) (*Result, error) {
-	points, err := parsePoints(p.Points.Array)
+	points, err := parsePoints(p.Points.Array, p.NumberOfPoints)
 	if err != nil {
 		return nil, err
 	}
-	fields, err := parseFields(p.PointData.Arrays)
+	fields, err := parseFields(p.PointData.Arrays, len(points))
 	if err != nil {
 		return nil, err
 	}
@@ -109,14 +114,20 @@ func resultFrom(p pieceXML) (*Result, error) {
 
 // parsePoints reshapes the Points block's flat 3-component DataArray into one [3]float64
 // per node, erroring if the parsed value count isn't a multiple of 3 — a malformed or
-// truncated file rather than a real VTU.
-func parsePoints(arr dataArrayXML) ([][3]float64, error) {
+// truncated file rather than a real VTU — or if the Piece declares points but the Points
+// DataArray came back empty: a truncated/crashed-solver write leaves <Points> absent (its
+// zero-valued DataArray parses to 0 values, and 0%3==0 trivially passes), which must not
+// be mistaken for a legitimate zero-point mesh.
+func parsePoints(arr dataArrayXML, declared int) ([][3]float64, error) {
 	vals, err := parseAsciiArray(arr)
 	if err != nil {
 		return nil, err
 	}
 	if len(vals)%3 != 0 {
 		return nil, fmt.Errorf("vtu: Points array has %d values, want a multiple of 3 (x,y,z per node)", len(vals))
+	}
+	if len(vals) == 0 && declared > 0 {
+		return nil, fmt.Errorf("vtu: Points DataArray is missing or empty, but Piece declares NumberOfPoints=%d", declared)
 	}
 	pts := make([][3]float64, len(vals)/3)
 	for i := range pts {
@@ -126,17 +137,35 @@ func parsePoints(arr dataArrayXML) ([][3]float64, error) {
 }
 
 // parseFields parses every PointData DataArray into the fields map, keyed by its original
-// Name attribute.
-func parseFields(arrs []dataArrayXML) (map[string]dataArray, error) {
+// Name attribute, erroring if any array's value count doesn't match its declared component
+// count times nPoints (the point count parsePoints already established) — a truncated
+// field write must not be silently misattributed to a different point/component shape.
+func parseFields(arrs []dataArrayXML, nPoints int) (map[string]dataArray, error) {
 	fields := make(map[string]dataArray, len(arrs))
 	for _, a := range arrs {
 		vals, err := parseAsciiArray(a)
 		if err != nil {
 			return nil, err
 		}
-		fields[a.Name] = dataArray{values: vals, comps: componentsOf(a)}
+		comps := componentsOf(a)
+		if err := checkFieldShape(a.Name, len(vals), comps, nPoints); err != nil {
+			return nil, err
+		}
+		fields[a.Name] = dataArray{values: vals, comps: comps}
 	}
 	return fields, nil
+}
+
+// checkFieldShape errors unless a DataArray's parsed value count matches comps*nPoints,
+// naming the field and both the got and want counts so a truncated write is diagnosable
+// from the error alone.
+func checkFieldShape(name string, gotLen, comps, nPoints int) error {
+	want := comps * nPoints
+	if gotLen != want {
+		return fmt.Errorf("vtu: DataArray %q has %d values, want %d (%d comps x %d points)",
+			name, gotLen, want, comps, nPoints)
+	}
+	return nil
 }
 
 // componentsOf returns a DataArray's component count, defaulting to 1 (VTK's own default
