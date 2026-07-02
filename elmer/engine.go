@@ -84,12 +84,13 @@ func (e *Engine) scratchDirSnapshot() string {
 	return e.scratchDir
 }
 
-// Notify receives host event bytes. A command.started carrying RunStudyCommandID runs the
-// Elmer study on a SEPARATE goroutine — never inline, because Notify is invoked on the host's
-// session goroutine and a host call from there blocks until the frame loop drains the
-// dispatcher (which cannot happen while we're inside it), deadlocking every host call. A
-// guard coalesces overlapping triggers so one study is in flight at a time. Grown in later
-// tasks (panel/browser events).
+// Notify receives host event bytes. A command.started carrying RunStudyCommandID (Part
+// ribbon) or RunStudyAssemblyCommandID (Assembly ribbon — see commands.go's elmerCommands for
+// why the same logical action needs two ids) runs the Elmer study on a SEPARATE goroutine —
+// never inline, because Notify is invoked on the host's session goroutine and a host call
+// from there blocks until the frame loop drains the dispatcher (which cannot happen while
+// we're inside it), deadlocking every host call. A guard coalesces overlapping triggers so
+// one study is in flight at a time. Grown in later tasks (panel/browser events).
 func (e *Engine) Notify(ev []byte) {
 	var hdr struct {
 		Type string `json:"type"`
@@ -117,9 +118,9 @@ func (e *Engine) onCommandStarted(ev []byte) {
 		return
 	}
 	switch c.Command {
-	case RunStudyCommandID:
+	case RunStudyCommandID, RunStudyAssemblyCommandID:
 		e.launchStudy()
-	case ShowPanelCommandID:
+	case ShowPanelCommandID, ShowPanelAssemblyCommandID:
 		go func() { _, _ = e.ShowPanel() }()
 	}
 }

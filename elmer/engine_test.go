@@ -146,15 +146,26 @@ func TestRegisterCommandsCreatesEveryCommand(t *testing.T) {
 	}
 }
 
-// TestCommandArgsLandOnFEATab asserts every Elmer command's built commandArgs places it on the
-// shared FEA ribbon tab, in Elmer's own category — checked directly against the wire.CreateCommandArgs
-// values (as ccx's ribbon_layout_test.go does), not through a fake host that discards the payload.
-func TestCommandArgsLandOnFEATab(t *testing.T) {
+// TestCommandArgsLandOnElmerTabBothRibbons asserts every Elmer command's built commandArgs
+// places it on Elmer's own "Elmer" ribbon tab (user directive: no longer the shared "FEA"
+// tab), in Elmer's own "Study" category, on the ribbon its elmerCommands entry declares — and
+// that, across the whole list, both the Part and Assembly ribbons are covered. Checked
+// directly against the wire.CreateCommandArgs values (as ccx's ribbon_layout_test.go does),
+// not through a fake host that discards the payload.
+func TestCommandArgsLandOnElmerTabBothRibbons(t *testing.T) {
+	seenRibbons := map[types.RibbonKey]bool{}
 	for _, c := range elmerCommands {
-		a := commandArgs(c.id, c.name, c.tip)
-		if a.Ribbon != types.PartRibbon || a.Tab != elmerRibbonTab || a.Category != elmerRibbonPanel {
-			t.Errorf("command %q placement wrong: ribbon=%q tab=%q category=%q", c.id, a.Ribbon, a.Tab, a.Category)
+		a := commandArgs(c.id, c.name, c.tip, c.ribbon)
+		if a.Tab != elmerRibbonTab || a.Category != elmerRibbonPanel {
+			t.Errorf("command %q placement wrong: tab=%q category=%q", c.id, a.Tab, a.Category)
 		}
+		if a.Ribbon != c.ribbon {
+			t.Errorf("command %q ribbon = %q, want %q", c.id, a.Ribbon, c.ribbon)
+		}
+		seenRibbons[c.ribbon] = true
+	}
+	if !seenRibbons[types.PartRibbon] || !seenRibbons[types.AssemblyRibbon] {
+		t.Fatalf("elmerCommands does not place commands on both ribbons: seen=%v", seenRibbons)
 	}
 }
 
