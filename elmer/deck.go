@@ -154,6 +154,18 @@ func writeConstants(b *sif.Builder) {
 // dump into the deck's Mesh DB directory (solve.go's checkSolverOutput globs case*.vtu
 // there). ASCII output only (Binary Output = False) — vtu.ReadFile (this task) does not
 // parse Elmer's binary/appended DataArray encoding.
+//
+// "Fixed Mesh = True" is load-bearing, not cosmetic: for a non-eigen/non-harmonic analysis
+// (this add-in's static elasticity case), ElmerSolver's VtuOutputSolver defaults to writing
+// each Point's DEFORMED position (original + displacement) unless told otherwise (upstream
+// VtuOutputSolver.F90: `RemoveDisp` — here, "Fixed Mesh" — gates the `x = x - Displacement`
+// step that restores the original coordinate). render.go's pointIndexForNodes assumes VTU
+// points sit at the mesh's own (undeformed) node coordinates — a live run against a
+// cantilever with a 1000 N tip load surfaced this: the free end's corner moved ~5 mm in the
+// VTU output, far past any coordinate-precision tolerance, so every node there looked
+// "unmatched" even though point order was never actually scrambled. No epsilon can paper
+// over a millimetre-scale deformation without risking real point-order desyncs going
+// undetected, so this must stay set.
 func outputSolverSection() *sif.Section {
 	s := mustSolverSection()
 	s.Set("Procedure", sif.FileAttr("ResultOutputSolve/ResultOutputSolver"))
@@ -162,6 +174,7 @@ func outputSolverSection() *sif.Section {
 	s.Set("Binary Output", false)
 	s.Set("Save Geometry Ids", true)
 	s.Set("Exec Solver", "After simulation")
+	s.Set("Fixed Mesh", true)
 	return s
 }
 

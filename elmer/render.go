@@ -155,13 +155,19 @@ func pointValue(values []float64, ptIdx map[int]int, nid int) (float64, error) {
 }
 
 // pointVerifyEpsAbs / pointVerifyEpsRel bound how far a VTU point may drift from its expected
-// mesh-node coordinate and still count as the "same" point: this add-in's mesh is in metres,
-// so 1e-9 m (1 nanometre) absolute is far tighter than any real node-coordinate difference,
-// while the relative term (times the mesh's bounding-box diagonal) keeps the check meaningful
-// for models much larger than a metre.
+// mesh-node coordinate and still count as the "same" point.
+//
+// ElmerSolver's ASCII VTU writer prints coordinates with Fortran's ES16.7E3 edit descriptor —
+// 1 digit + 7 decimals in normalized scientific notation, i.e. 8 significant digits — so
+// round-tripping a coordinate through that text can move it by up to half a unit in the last
+// digit: ~5e-8 of the coordinate's own magnitude. pointVerifyEpsRel = 5e-7 gives that a 10x
+// safety margin (so honest text-precision drift from a real solve always passes) while still
+// sitting ~4-5 orders of magnitude below any real node spacing in a solid mesh, so a genuinely
+// desynced point still fails the check. pointVerifyEpsAbs = 1e-12 is a floor for coordinates at
+// (or very near) the origin, where the relative term alone would collapse toward 0.
 const (
-	pointVerifyEpsAbs = 1e-9
-	pointVerifyEpsRel = 1e-9
+	pointVerifyEpsAbs = 1e-12
+	pointVerifyEpsRel = 5e-7
 )
 
 // pointIndexForNodes returns, for each mesh node id, the 0-based index into points (and
@@ -185,12 +191,27 @@ func pointIndexForNodes(mesh *TetMesh, points [][3]float64) (map[int]int, error)
 	return remapPointsByCoordinate(sorted, points, eps)
 }
 
-// pointVerifyEpsilon returns the coordinate-match tolerance for nodes' bounding-box scale.
+// pointVerifyEpsilon returns the coordinate-match tolerance for a mesh: pointVerifyEpsAbs plus
+// pointVerifyEpsRel times coordinateScale(nodes), so it stays proportioned to the ASCII
+// round-trip error ElmerSolver's writer can introduce (see the constants' doc comment)
+// regardless of the mesh's size or how far it sits from the origin.
 func pointVerifyEpsilon(nodes []Node) float64 {
-	if diag := bboxDiagonal(nodes); diag*pointVerifyEpsRel > pointVerifyEpsAbs {
-		return diag * pointVerifyEpsRel
+	return pointVerifyEpsAbs + pointVerifyEpsRel*coordinateScale(nodes)
+}
+
+// coordinateScale returns the largest length scale present in nodes: either the bounding-box
+// diagonal (captures a spread-out part near the origin) or the largest absolute coordinate
+// component seen on any node (captures a part offset far from the origin, where the ASCII
+// round-trip error on that axis scales with the coordinate's own magnitude, not the part's
+// span) — whichever is larger. Using the diagonal alone would under-tolerance a small part
+// modeled a long way from the origin: its bbox is small even though every coordinate carries a
+// large-magnitude round-trip error.
+func coordinateScale(nodes []Node) float64 {
+	scale := bboxDiagonal(nodes)
+	for _, n := range nodes {
+		scale = math.Max(scale, math.Max(math.Abs(n.X), math.Max(math.Abs(n.Y), math.Abs(n.Z))))
 	}
-	return pointVerifyEpsAbs
+	return scale
 }
 
 // bboxDiagonal returns the diagonal length of nodes' axis-aligned bounding box (0 for an

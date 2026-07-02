@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -145,6 +146,65 @@ func TestSurfaceRenderDataErrorsOnAlienVTUPoint(t *testing.T) {
 	if _, _, _, err := surfaceRenderData(mesh, res, values); err == nil {
 		t.Fatal("surfaceRenderData: want an error when a mesh node has no matching VTU point")
 	}
+}
+
+// TestSurfaceRenderDataAcceptsSolverAsciiPrecisionRoundTrip proves the point-order guard's
+// tolerance is loose enough for ElmerSolver's own ASCII VTU output, not just Go's lossless
+// "%g" (finding 1, task-12 review, follow-up): the solver writes point coordinates with
+// Fortran's ES16.7E3 edit descriptor (8 significant digits), so a coordinate that round-trips
+// through that text loses up to ~5e-8 of its own magnitude even when the writer never
+// reordered a single point. Before this fix, pointVerifyEpsAbs/Rel = 1e-9 was ~50x tighter
+// than that unavoidable precision loss, so the fast (identity-order) path failed on every real
+// solve and fell through to remapPointsByCoordinate with the same too-tight eps, hard-erroring
+// even though the points never actually moved out of order.
+func TestSurfaceRenderDataAcceptsSolverAsciiPrecisionRoundTrip(t *testing.T) {
+	mesh := &TetMesh{
+		Nodes: []Node{
+			{ID: 1, X: 0.123456785, Y: 0.005432105, Z: 0},
+			{ID: 2, X: 0.2, Y: 0, Z: 0.099999955},
+		},
+		Surface: []BoundaryFacet{
+			{Nodes: []int{1, 2}, Corners: [3]int{1, 2, 1}, Face: 1},
+		},
+	}
+	// Same points, in the SAME (identity) order as mesh.Nodes — never permuted, never alien —
+	// but each coordinate has been through exactly the lossy 8-significant-digit ASCII
+	// round-trip ElmerSolver's writer performs.
+	points := [][3]float64{
+		asciiRoundTrip(t, mesh.Nodes[0].X, mesh.Nodes[0].Y, mesh.Nodes[0].Z),
+		asciiRoundTrip(t, mesh.Nodes[1].X, mesh.Nodes[1].Y, mesh.Nodes[1].Z),
+	}
+	res := vtuWithPoints(t, filepath.Join(t.TempDir(), "ascii-precision.vtu"), points, []float64{10, 20})
+	values, _, _, err := resultFieldFor(res, resultFieldVonMises)
+	if err != nil {
+		t.Fatalf("resultFieldFor: %v", err)
+	}
+	if _, _, _, err := surfaceRenderData(mesh, res, values); err != nil {
+		t.Fatalf("surfaceRenderData: %v (identity-order VTU points at solver ASCII precision must not error)", err)
+	}
+}
+
+// asciiRoundTrip formats x,y,z the way ElmerSolver's ASCII VTU writer does — Fortran's
+// ES16.7E3 edit descriptor, 8 significant digits in normalized scientific notation — and
+// parses the text back, reproducing exactly the precision loss a real solve's coordinates
+// carry by the time this add-in reads them back, even when the writer never touched point
+// order.
+func asciiRoundTrip(t *testing.T, x, y, z float64) [3]float64 {
+	t.Helper()
+	return [3]float64{ascii8SigFigs(t, x), ascii8SigFigs(t, y), ascii8SigFigs(t, z)}
+}
+
+// ascii8SigFigs rounds v to 8 significant digits (1 digit + 7 decimals, mirroring Go's "%.7E"
+// against Fortran's ES16.7E3) by formatting and re-parsing it, the same lossy path a real
+// coordinate takes through ElmerSolver's ASCII VTU output and back through this add-in's
+// reader.
+func ascii8SigFigs(t *testing.T, v float64) float64 {
+	t.Helper()
+	out, err := strconv.ParseFloat(fmt.Sprintf("%.7E", v), 64)
+	if err != nil {
+		t.Fatalf("ascii8SigFigs(%v): %v", v, err)
+	}
+	return out
 }
 
 // TestResultFieldForVonMises pins the default (any kind != displacement) branch: the raw
