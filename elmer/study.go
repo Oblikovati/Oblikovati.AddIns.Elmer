@@ -50,6 +50,7 @@ const mmToM = 0.001
 // removed on success; a failure keeps it (named in the returned error) so a stuck deck/mesh
 // is inspectable.
 func (e *Engine) runStudy() (StudyResult, error) {
+	e.setScratchDir("") // no dir yet this run; a panic before MkdirTemp has nothing to name
 	s := e.study()
 	if err := validateStudySettings(s); err != nil {
 		return StudyResult{}, err
@@ -62,6 +63,7 @@ func (e *Engine) runStudy() (StudyResult, error) {
 	if err != nil {
 		return StudyResult{}, fmt.Errorf("elmer: create study scratch dir: %w", err)
 	}
+	e.setScratchDir(dir) // now known — runAndReport's panic path can name it too
 	result, err := e.runStudyIn(dir, s, faces)
 	if err != nil {
 		return StudyResult{}, fmt.Errorf("%w (scratch dir kept for inspection: %s)", err, dir)

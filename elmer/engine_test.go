@@ -167,3 +167,38 @@ func TestStartRegistersCommands(t *testing.T) {
 		t.Errorf("Start never called %q (calls: %v)", wire.MethodCommandsCreate, h.methods())
 	}
 }
+
+// TestCrashStatusNamesScratchDirWhenKnown pins runAndReport's panic-recovery status message
+// (Minor 3, task-12 review): the kept scratch dir is named exactly like the ordinary error
+// path already does (study.go's runStudy), whenever the dir was already known at panic time.
+func TestCrashStatusNamesScratchDirWhenKnown(t *testing.T) {
+	got := crashStatus("boom", "/tmp/elmer-study-abc123")
+	want := "Elmer study crashed: boom (scratch dir kept for inspection: /tmp/elmer-study-abc123)"
+	if got != want {
+		t.Errorf("crashStatus = %q, want %q", got, want)
+	}
+}
+
+// TestCrashStatusOmitsScratchDirWhenUnknown pins the honest-omission case: a panic before
+// os.MkdirTemp ran (e.g. inside e.study()) has no dir to name, so crashStatus must not
+// fabricate or reuse a stale one.
+func TestCrashStatusOmitsScratchDirWhenUnknown(t *testing.T) {
+	got := crashStatus("boom", "")
+	want := "Elmer study crashed: boom"
+	if got != want {
+		t.Errorf("crashStatus = %q, want %q", got, want)
+	}
+}
+
+// TestScratchDirSnapshotRoundTrips pins setScratchDir/scratchDirSnapshot's lock-guarded round
+// trip, including a fresh Engine's "" default (no study has run yet).
+func TestScratchDirSnapshotRoundTrips(t *testing.T) {
+	e := NewEngine(newFakeHost())
+	if got := e.scratchDirSnapshot(); got != "" {
+		t.Fatalf("scratchDirSnapshot on a fresh Engine = %q, want \"\"", got)
+	}
+	e.setScratchDir("/tmp/elmer-study-xyz")
+	if got := e.scratchDirSnapshot(); got != "/tmp/elmer-study-xyz" {
+		t.Errorf("scratchDirSnapshot = %q, want /tmp/elmer-study-xyz", got)
+	}
+}

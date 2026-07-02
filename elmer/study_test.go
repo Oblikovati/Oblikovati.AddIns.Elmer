@@ -158,11 +158,11 @@ func TestRunAndReportDrivesFullPipelineWithStubbedSolve(t *testing.T) {
 	e.solve = func(dir string) (string, error) {
 		sawFiles = deckAndMeshFilesExist(t, dir)
 		solveRan = true
-		n, err := meshNodeCountFrom(dir)
+		coords, err := meshNodeCoordsFrom(dir)
 		if err != nil {
-			return "", fmt.Errorf("read mesh node count: %w", err)
+			return "", fmt.Errorf("read mesh node coords: %w", err)
 		}
-		if err := writeFakeVTU(filepath.Join(dir, "case0001.vtu"), n); err != nil {
+		if err := writeFakeVTU(filepath.Join(dir, "case0001.vtu"), coords); err != nil {
 			return "", err
 		}
 		return "MAIN: solving...\nALL DONE\n", nil
@@ -200,33 +200,40 @@ func deckAndMeshFilesExist(t *testing.T, dir string) bool {
 	return ok
 }
 
-// meshNodeCountFrom reads mesh.header's node count (its first integer field) — the point
-// count the synthesized VTU fixture must match.
-func meshNodeCountFrom(dir string) (int, error) {
-	data, err := os.ReadFile(filepath.Join(dir, "mesh.header"))
+// meshNodeCoordsFrom reads mesh.nodes' coordinates in id order ("id -1 x y z" per line,
+// already ascending — see meshfmt.formatNodes) — the exact point order/positions
+// render.go's pointIndexForNodes fast path expects a real ElmerSolver VTU to carry, so the
+// synthesized VTU fixture below must reuse them rather than inventing placeholder
+// coordinates (finding 1, task-12 review: a VTU whose points don't geometrically match the
+// mesh now errors instead of being trusted positionally).
+func meshNodeCoordsFrom(dir string) ([][3]float64, error) {
+	data, err := os.ReadFile(filepath.Join(dir, "mesh.nodes"))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var n int
-	if _, err := fmt.Sscanf(string(data), "%d", &n); err != nil {
-		return 0, fmt.Errorf("parse mesh.header: %w", err)
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	coords := make([][3]float64, len(lines))
+	for i, line := range lines {
+		var id, part int
+		if _, err := fmt.Sscanf(line, "%d %d %g %g %g", &id, &part, &coords[i][0], &coords[i][1], &coords[i][2]); err != nil {
+			return nil, fmt.Errorf("parse mesh.nodes line %d (%q): %w", i+1, line, err)
+		}
 	}
-	return n, nil
+	return coords, nil
 }
 
-// writeFakeVTU synthesizes a minimal valid ElmerSolver-shaped VTU with n points: a
-// "vonmises" scalar ramping 1..n (so Min/Max are distinct and predictable) and a
-// zero-valued "displacement" vector field, standing in for a real solve's case0001.vtu
-// (reusing the same field-name/shape convention as elmer/vtu/testdata/mini.vtu, Task 11's
-// fixture).
-func writeFakeVTU(path string, n int) error {
+// writeFakeVTU synthesizes a minimal valid ElmerSolver-shaped VTU whose points are the mesh's
+// own node coordinates (mirroring a real solve's case0001.vtu, which writes points in that
+// same ascending-id order — see meshNodeCoordsFrom): a "vonmises" scalar ramping 1..n (so
+// Min/Max are distinct and predictable) and a zero-valued "displacement" vector field.
+func writeFakeVTU(path string, coords [][3]float64) error {
 	var pts, disp, vm strings.Builder
-	for i := 0; i < n; i++ {
-		fmt.Fprintf(&pts, " %g %g %g", float64(i), 0.0, 0.0)
+	for i, c := range coords {
+		fmt.Fprintf(&pts, " %g %g %g", c[0], c[1], c[2])
 		fmt.Fprintf(&disp, " %g %g %g", 0.0, 0.0, 0.0)
 		fmt.Fprintf(&vm, " %g", float64(i+1))
 	}
-	content := fmt.Sprintf(fakeVTUTemplate, n, disp.String(), vm.String(), pts.String())
+	content := fmt.Sprintf(fakeVTUTemplate, len(coords), disp.String(), vm.String(), pts.String())
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 

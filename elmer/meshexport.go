@@ -76,22 +76,11 @@ func exportNodes(m *TetMesh) ([][3]float64, map[int]int) {
 	return nodes, index
 }
 
-// compactNodeIndex maps each node's original TetMesh id to its compact 1-based meshfmt
-// index, in ascending-id order — the same mapping exportNodes builds, exposed standalone
-// for render.go: ElmerSolver writes its VTU result points in the same order
-// meshfmt.Write wrote mesh.nodes (this same ascending-id compaction), so a node's VTU
-// point index is compactNodeIndex(mesh.Nodes)[id]-1.
-func compactNodeIndex(nodes []Node) map[int]int {
-	sorted := sortNodesByID(nodes)
-	index := make(map[int]int, len(sorted))
-	for i, n := range sorted {
-		index[n.ID] = i + 1
-	}
-	return index
-}
-
 // sortNodesByID returns a copy of nodes sorted ascending by ID, the common ordering
-// exportNodes and compactNodeIndex both compact node ids against.
+// exportNodes and render.go's pointIndexForNodes both compact node ids against — ElmerSolver
+// writes its VTU result points in this same ascending-id order (meshfmt.Write wrote
+// mesh.nodes in it), which is what pointIndexForNodes' fast path confirms geometrically
+// rather than assumes.
 func sortNodesByID(nodes []Node) []Node {
 	sorted := append([]Node(nil), nodes...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })

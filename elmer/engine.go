@@ -29,10 +29,11 @@ type Engine struct {
 	host HostCaller
 	api  *client.Client
 
-	mu          sync.Mutex         // guards analysis, resultField, running
+	mu          sync.Mutex         // guards analysis, resultField, running, scratchDir
 	analysis    *femmodel.Analysis // tree-owned source of truth (Mesh/Material/Load)
 	resultField string             // M1: "vonmises" | "displacement" (engine-only, see panel.go's applyResultEdit)
 	running     bool               // a study is in flight (coalesces overlapping triggers)
+	scratchDir  string             // current study's kept-on-failure scratch dir, "" until known (study.go's runStudy)
 
 	// solve runs the resolved deck in dir and returns ElmerSolver's combined stdout — a
 	// stubbable seam (defaults to runElmerSolver) so tests can drive the whole pipeline
@@ -63,6 +64,24 @@ func (e *Engine) resultFieldKind() string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.resultField
+}
+
+// setScratchDir records the current study's scratch dir (or "" once it's no longer known to
+// be current, e.g. at the start of a fresh run) — see runAndReport's panic-recovery path,
+// which reads it back through scratchDirSnapshot to name a crash's kept dir the same way the
+// ordinary error path already does (study.go's runStudy).
+func (e *Engine) setScratchDir(dir string) {
+	e.mu.Lock()
+	e.scratchDir = dir
+	e.mu.Unlock()
+}
+
+// scratchDirSnapshot returns the current study's scratch dir, or "" if none is known yet
+// (e.g. a panic before os.MkdirTemp ran).
+func (e *Engine) scratchDirSnapshot() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.scratchDir
 }
 
 // Notify receives host event bytes. A command.started carrying RunStudyCommandID runs the
@@ -134,14 +153,16 @@ func (e *Engine) launchStudy() {
 
 // runAndReport runs one study and reports its outcome, recovering from any panic in the
 // pipeline so a bug cannot take down the in-process host — the failure is surfaced on the
-// status bar instead.
+// status bar instead, naming the kept scratch dir when one is already known (mirroring the
+// ordinary error path's "scratch dir kept for inspection" message, study.go:67) so a crash
+// mid-study is just as inspectable as a clean failure.
 func (e *Engine) runAndReport() {
 	defer func() {
 		e.mu.Lock()
 		e.running = false
 		e.mu.Unlock()
 		if r := recover(); r != nil {
-			e.reportStatus(fmt.Sprintf("Elmer study crashed: %v", r))
+			e.reportStatus(crashStatus(r, e.scratchDirSnapshot()))
 		}
 	}()
 	res, err := e.runStudy()
@@ -150,6 +171,18 @@ func (e *Engine) runAndReport() {
 		return
 	}
 	e.reportStatus(res.Summary())
+}
+
+// crashStatus builds runAndReport's panic status message, appending the kept scratch dir
+// only when one was already known at panic time (dir == "" for a panic before
+// os.MkdirTemp ran, e.g. inside e.study()) — an honest "no path yet" rather than a stale or
+// fabricated one.
+func crashStatus(r any, dir string) string {
+	msg := fmt.Sprintf("Elmer study crashed: %v", r)
+	if dir != "" {
+		msg += fmt.Sprintf(" (scratch dir kept for inspection: %s)", dir)
+	}
+	return msg
 }
 
 // reportStatus surfaces a study's outcome on the host status bar (best-effort: a status
