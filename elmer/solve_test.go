@@ -153,6 +153,53 @@ func TestRunElmerSolverWritesStartInfoRunsInDirAndCapturesOutput(t *testing.T) {
 	}
 }
 
+// TestRunElmerSolverSwallowsNonZeroExit pins launchError's whole reason for existing:
+// ElmerSolver's own exit-code convention is unreliable (it can print ALL DONE and still
+// exit non-zero, or vice versa), so runElmerSolver must NOT treat a non-zero exit as a
+// launch failure — checkSolverOutput is what judges success, from the captured stdout.
+func TestRunElmerSolverSwallowsNonZeroExit(t *testing.T) {
+	dir := t.TempDir()
+	script := fakeSolverScript(t, "ALL DONE\n")
+	failingScript := script + "-failing"
+	original, err := os.ReadFile(script)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(failingScript, append(original, []byte("\nexit 1\n")...), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OBK_ELMER_BIN", failingScript)
+
+	stdout, err := runElmerSolver(dir)
+	if err != nil {
+		t.Fatalf("runElmerSolver: a non-zero solver exit must not itself be an error, got: %v", err)
+	}
+	if !strings.Contains(stdout, "ALL DONE") {
+		t.Errorf("captured stdout = %q, want it to still contain %q", stdout, "ALL DONE")
+	}
+}
+
+// TestLaunchErrorSurfacesNonExitFailures confirms the other half of launchError's
+// contract: a failure that means the solver never ran at all (not executable) IS
+// surfaced — unlike a non-zero exit, this is not something checkSolverOutput can judge
+// from stdout, because there is no stdout. resolveElmerBin resolves the path fine (a
+// regular file passes its existence check); it is the OS exec() call itself that fails.
+func TestLaunchErrorSurfacesNonExitFailures(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("relies on POSIX executable-bit semantics")
+	}
+	dir := t.TempDir()
+	notExecutable := filepath.Join(dir, "not-executable")
+	if err := os.WriteFile(notExecutable, []byte("#!/bin/sh\necho hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OBK_ELMER_BIN", notExecutable)
+
+	if _, err := runElmerSolver(t.TempDir()); err == nil {
+		t.Fatal("runElmerSolver: expected an error when the resolved binary is not executable")
+	}
+}
+
 func TestRunElmerSolverErrorsWhenBinaryUnresolved(t *testing.T) {
 	t.Setenv("OBK_ELMER_BIN", "")
 	t.Setenv("PATH", t.TempDir()) // hide any real ElmerSolver on PATH
