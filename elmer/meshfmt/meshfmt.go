@@ -40,9 +40,9 @@ type Tet struct {
 
 // BoundaryFace is one boundary element: a triangular face (3 nodes, type 303) or its quadratic
 // counterpart (6 nodes, type 306). Boundary is the Elmer boundary-condition target id; Parent is
-// the single body the face belongs to. Elmer's on-disk format reserves a second parent slot for
-// internal (shared) boundaries between two bodies; meshfmt only ever writes external faces, so
-// that slot is always emitted as 0.
+// the 1-based id of the parent element (a Tet) that owns the face. Elmer's on-disk format
+// reserves a second parent slot for internal (shared) boundaries between two bodies; meshfmt
+// only ever writes external faces, so that slot is always emitted as 0.
 type BoundaryFace struct {
 	Boundary int
 	Parent   int

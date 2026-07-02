@@ -135,7 +135,7 @@ func TestNotifyRunStudyLaunchesGoroutineOnce(t *testing.T) {
 // TestRegisterCommandsCreatesEveryCommand verifies RegisterCommands issues one commands.create
 // call per entry in elmerCommands. It only proves call count — the fake host discards the
 // payload it's called with, so it cannot prove ribbon placement; that's asserted directly
-// against commandArgs's output in TestCommandArgsLandOnFEATab below.
+// against commandArgs's output in TestCommandArgsLandOnElmerTabBothRibbons below.
 func TestRegisterCommandsCreatesEveryCommand(t *testing.T) {
 	h := newFakeHost()
 	if err := NewEngine(h).RegisterCommands(); err != nil {

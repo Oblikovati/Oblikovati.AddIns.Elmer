@@ -44,7 +44,7 @@ oracle in both directions; the M1 slice below proves that pipeline on linear ela
 ```sh
 make build      # cgo c-shared library into build/
 make install    # build + copy library + manifest into the host's add-ins dir
-make test       # cgo-free elmer engine unit tests + add-in<->host integration
+make test       # cgo-free elmer engine unit tests (add-in<->host integration tests are a future addition)
 ```
 
 `make install` copies into `../Oblikovati/head/addins` by default (the app repo is

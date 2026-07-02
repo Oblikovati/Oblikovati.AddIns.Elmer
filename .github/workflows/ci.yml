@@ -16,10 +16,10 @@ defaults:
 
 # The oblikovati-elmer add-in (module oblikovati.org/elmer). The SHIPPED c-shared
 # library links only the Apache-2.0 contract (oblikovati.org/api), pinned in go.mod to the
-# latest published API release; the GPL application module (oblikovati.org) is pulled in
-# solely by the add-in<->host integration tests. Both are sibling repos wired by the local
+# latest published API release. It is a sibling repo wired by the local
 # .github/actions/siblings composite (ADR-0018), which checks api out at the pinned release
-# so CI validates against exactly what ships.
+# so CI validates against exactly what ships. Add-in<->host integration tests (against the
+# GPL oblikovati.org module) are a future addition, not present in this repo today.
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -41,9 +41,10 @@ jobs:
       - uses: actions/checkout@v5
       - run: python3 scripts/add-spdx-headers.py --check
 
-  # Tier 1 — cgo-free unit + add-in<->host integration tests on every OS. The host's
-  # headless core is pure Go, so the integration tests (which drive the live
-  # router/model) run with CGO_ENABLED=0 on all three platforms.
+  # Tier 1 — cgo-free unit tests on every OS. Add-in<->host integration tests (which would
+  # drive the live router/model) are a future addition; this job's CGO_ENABLED=0 across all
+  # three platforms is already how they'd run once they land, since the host's headless
+  # core is pure Go.
   test:
     strategy:
       fail-fast: false
@@ -174,8 +175,21 @@ jobs:
         run: vendor-src/elmer/build.sh
       - name: Validate ElmerSolver solves the 5-tet cube (peak w must equal 1.0e-3 m)
         run: vendor-src/elmer/test/run.sh
-      # Tag-gated oracle tests land in Task 13 (analytic solutions driven through the real
-      # solver); zero tests match `solvers` today, so this step is a green no-op until then.
+      # Fail loudly, not silently, if either vendored binary is missing or not executable —
+      # e.g. a corrupt/partial cache restore. Without this, the oracle tests below would
+      # just skip (requireElmerAndGmsh is designed to skip when a binary can't be resolved,
+      # which is the right behavior for a plain local `go test`), and the job would report
+      # green having exercised nothing.
+      - name: Verify vendored solver binaries are executable
+        env:
+          OBK_ELMER_BIN: ${{ github.workspace }}/vendor-src/elmer/install/bin/ElmerSolver
+          OBK_GMSH_BIN: ${{ github.workspace }}/vendor-src/gmsh/build/gmsh
+        run: |
+          test -x "$OBK_ELMER_BIN" || { echo "::error::OBK_ELMER_BIN not executable: $OBK_ELMER_BIN" >&2; exit 1; }
+          test -x "$OBK_GMSH_BIN" || { echo "::error::OBK_GMSH_BIN not executable: $OBK_GMSH_BIN" >&2; exit 1; }
+      # The oracle tests (elmer/oracle_solvers_test.go, landed Task 13) drive the real
+      # vendored gmsh + ElmerSolver through the full pipeline and assert against closed-form
+      # analytic results — the permanent physics gate for this add-in's M1 pipeline.
       - name: Tag-gated solver oracle tests
         env:
           OBK_ELMER_BIN: ${{ github.workspace }}/vendor-src/elmer/install/bin/ElmerSolver

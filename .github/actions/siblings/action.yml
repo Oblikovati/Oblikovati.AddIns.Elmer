@@ -1,12 +1,15 @@
 # Resolve the add-in's cross-repo deps for CI/build (ADR-0018): check out the Apache-2.0
 # contract oblikovati.org/api (by default at the version pinned in go.mod — the latest
-# PUBLISHED release the add-in tracks) and the GPL host oblikovati.org (at develop, used
-# only by the add-in<->host integration tests), inject the equivalent `replace`s the
-# committed go.mod omits, and vendor the C ABI header cgo builds include.
+# PUBLISHED release the add-in tracks), inject the equivalent `replace` the committed
+# go.mod omits, and vendor the C ABI header cgo builds include. The GPL host
+# (oblikovati.org) is NOT checked out here: no test in this repo imports it today — the
+# shipped library links only oblikovati.org/api. Add-in<->host integration tests are a
+# future addition; when they land, this action should grow the host checkout + replace
+# back in.
 #
 # Run it AFTER actions/setup-go (it shells `go mod edit`/`go list`).
 name: Resolve siblings
-description: Check out oblikovati.org/api (pinned release) + the GPL host and wire the module graph.
+description: Check out oblikovati.org/api (pinned release) and wire the module graph.
 
 inputs:
   api-ref:
@@ -45,17 +48,10 @@ runs:
         ref: ${{ steps.resolve.outputs.ref }}
         path: _api
 
-    - uses: actions/checkout@v5
-      with:
-        repository: Oblikovati/Oblikovati
-        ref: develop
-        path: _app
-
     - shell: bash
       run: |
         set -euo pipefail
         go mod edit -replace oblikovati.org/api="$GITHUB_WORKSPACE/_api"
-        go mod edit -replace oblikovati.org="$GITHUB_WORKSPACE/_app"
         # Vendor the C ABI header so cgo builds can -I include/ (harmless for non-cgo jobs).
         api_dir=$(go list -m -f '{{.Dir}}' oblikovati.org/api)
         mkdir -p include

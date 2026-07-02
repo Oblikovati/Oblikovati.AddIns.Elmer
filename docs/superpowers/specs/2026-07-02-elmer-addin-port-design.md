@@ -1,9 +1,10 @@
 # Oblikovati.AddIns.Elmer — Elmer multiphysics FEA add-in (port design)
 
 Date: 2026-07-02
-Status: ACCEPTED — M0/MV/M1 built and merged against this design; §15's open questions
-are answered below. Decisions D1-D6 stood as taken; D3 (mesh handoff) and D6 (result
-decode) are additionally pinned by ADR-0001 with the load-bearing details M1 surfaced.
+Status: ACCEPTED — M0/MV/M1 built and validated on PR #1 against this design; §15's open
+questions are answered below. Decisions D1-D6 stood as taken; D3 (mesh handoff) and D6
+(result decode) are additionally pinned by ADR-0001 with the load-bearing details M1
+surfaced.
 
 ## 1. Goal
 
