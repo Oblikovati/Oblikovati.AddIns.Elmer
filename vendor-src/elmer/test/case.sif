@@ -1,0 +1,64 @@
+Check Keywords "Warn"
+
+Header
+  Mesh DB "mesh" "."
+End
+
+Simulation
+  Coordinate System = Cartesian 3D
+  Simulation Type = Steady State
+  Steady State Max Iterations = 1
+  Max Output Level = 5
+End
+
+Body 1
+  Target Bodies(1) = 1
+  Equation = 1
+  Material = 1
+End
+
+Solver 1
+  Equation = "Stress Solver"
+  Procedure = "StressSolve" "StressSolver"
+  Variable = "Displacement"
+  Variable DOFs = 3
+  Calculate Stresses = True
+  Linear System Solver = "Iterative"
+  Linear System Iterative Method = "BiCGStab"
+  Linear System Max Iterations = 500
+  Linear System Convergence Tolerance = 1.0e-10
+  Linear System Preconditioning = "ILU0"
+  Steady State Convergence Tolerance = 1.0e-5
+End
+
+Solver 2
+  Equation = "ResultOutput"
+  Exec Solver = "After simulation"
+  Procedure = "ResultOutputSolve" "ResultOutputSolver"
+  Output File Name = "case"
+  Vtu Format = True
+  Binary Output = False
+End
+
+Equation 1
+  Active Solvers(2) = 1 2
+End
+
+Material 1
+  Youngs Modulus = 1.0e9
+  Poisson ratio = 0.0
+  Density = 1000.0
+End
+
+Boundary Condition 1
+  Target Boundaries(1) = 1
+  Displacement 1 = 0.0
+  Displacement 2 = 0.0
+  Displacement 3 = 0.0
+End
+
+Boundary Condition 2
+  Target Boundaries(1) = 2
+  Force 3 = 1.0e6
+  Force 3 Normalize by Area = Logical True
+End

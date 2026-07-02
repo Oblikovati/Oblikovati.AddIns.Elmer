@@ -1,0 +1,115 @@
+!/*****************************************************************************/
+! *
+! *  Elmer, A Finite Element Software for Multiphysical Problems
+! *
+! *  Copyright 1st April 1995 - , CSC - IT Center for Science Ltd., Finland
+! * 
+! *  This library is free software; you can redistribute it and/or
+! *  modify it under the terms of the GNU Lesser General Public
+! *  License as published by the Free Software Foundation; either
+! *  version 2.1 of the License, or (at your option) any later version.
+! *
+! *  This library is distributed in the hope that it will be useful,
+! *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+! *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+! *  Lesser General Public License for more details.
+! * 
+! *  You should have received a copy of the GNU Lesser General Public
+! *  License along with this library (in file ../LGPL-2.1); if not, write 
+! *  to the Free Software Foundation, Inc., 51 Franklin Street, 
+! *  Fifth Floor, Boston, MA  02110-1301  USA
+! *
+! *****************************************************************************/
+!/******************************************************************************
+! *
+! *  A simple solver wrapper around WriteMeshToDisk2 to write the mesh
+! *  to disk.
+! *
+! ******************************************************************************
+! *
+! *  Authors: Joe Todd, Juha Ruokolainen
+! *  Email:   Juha.Ruokolainen@csc.fi
+! *  Web:     http://www.csc.fi/elmer
+! *  Address: CSC - IT Center for Science Ltd.
+! *           Keilaranta 14
+! *           02101 Espoo, Finland 
+! *
+! *  Original Date: 15.09.2014
+! *
+! *****************************************************************************/
+
+SUBROUTINE SaveMesh( Model,Solver,dt,TransientSimulation )
+
+  USE DefUtils
+  USE MeshUtils
+  USE LoadMod
+
+  IMPLICIT NONE
+
+  TYPE(Model_t) :: Model
+  TYPE(Solver_t) :: Solver
+  REAL(KIND=dp) :: dt
+  LOGICAL :: TransientSimulation
+!---------------------------------------------------------------
+  LOGICAL :: SaveMeshLogical, EveryTime, Found
+  INTEGER :: i, parts, ierr
+  TYPE(Mesh_t), POINTER :: Mesh
+  TYPE(Variable_t), POINTER :: TimestepVar
+  CHARACTER(LEN=MAX_NAME_LEN):: MeshName, MeshDir, inty, tmp
+
+  Mesh => Solver % Mesh
+  SaveMeshLogical = ListGetLogical(Solver % Values, "Save Mesh", Found)
+  IF(.NOT.Found) THEN
+    Call Warn("Save Mesh","Can't find Save Mesh logical")
+    SaveMeshLogical = .FALSE.
+  END IF
+
+  IF(.NOT. SaveMeshLogical) RETURN !nothing to do
+
+  TimestepVar => VariableGet( Mesh % Variables, "Timestep", .TRUE. )
+
+  MeshName = ListgetString( Solver % Values,"Mesh Name", Found)
+  IF(.NOT. Found) CALL FATAL("SaveMesh","No name given for mesh")
+
+  MeshDir = ListgetString( Solver % Values,&
+       "Save Mesh Directory", Found)
+  IF(.NOT. Found) CALL FATAL("SaveMesh",&
+       "No directory given to save mesh")
+  CALL MakeDirectory(TRIM(MeshDir) // CHAR(0))
+
+  EveryTime = ListGetLogical( Solver % Values, "Save All Timesteps", Found)
+  IF(.NOT. Found) EveryTime = .FALSE.
+
+  IF(EveryTime) THEN
+     WRITE(MeshDir, '(A,A,A,i4.4)') TRIM(MeshDir),TRIM(MeshName),"_",INT(TimestepVar % Values(1))
+  ELSE
+     WRITE(MeshDir, '(A,A)')TRIM(MeshDir)//TRIM(MeshName)
+  END IF
+
+  IF( ParEnv % PEs<=1 ) THEN !serial
+     CALL MakeDirectory(TRIM(MeshDir) // CHAR(0))
+     CALL WriteMeshToDisk2(Model, Mesh, MeshDir)
+  ELSE !parallel
+
+     !MakeDirectory seems unable to create multi/level/directories
+     !so create the top level first, then the lower
+     IF(ParEnv % MyPe==0) CALL MakeDirectory(TRIM(MeshDir) // CHAR(0))
+     
+     parts = ParEnv % PEs
+
+     tmp = TRIM(MeshDir)//"/partitioning."
+     MeshDir = TRIM(tmp)
+
+     WRITE (tmp, '(A,I0)') TRIM(MeshDir),parts
+     MeshDir = TRIM(tmp)
+
+     IF(ParEnv % MyPe==0) THEN
+        PRINT *, 'Save Mesh, creating directory: '//MeshDir
+        CALL MakeDirectory(TRIM(MeshDir) // CHAR(0))
+     END IF
+     CALL MPI_BARRIER(ELMER_COMM_WORLD, ierr)
+
+     CALL WriteMeshToDisk2(Model, Mesh, MeshDir, ParEnv % MyPe)
+  END IF
+
+END SUBROUTINE SaveMesh
