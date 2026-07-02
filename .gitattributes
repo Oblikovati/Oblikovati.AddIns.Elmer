@@ -1,0 +1,13 @@
+# Pin LF checkout for everything text. Root cause: Windows Actions runners default to
+# `core.autocrlf=true`, which rewrites checked-out text files to CRLF. Our Go writers
+# (elmer/sif, elmer/meshfmt) always emit LF, so the golden-file byte-compare tests
+# (TestBuildDeckGoldenCantilever, TestWriteGoldenCube5Tet, TestWriteGoldenOrder2Tet10,
+# TestWriteGoldenMinimal) diffed byte-identical-looking content that differed only in
+# line-ending bytes on windows-latest (CI run 28626269787). `text=auto eol=lf` is chosen
+# repo-wide rather than scoping to elmer/**/testdata: this is a Go repo whose own writers
+# emit LF, vendor-src is committed source that builds on Linux CI and locally (LF is its
+# native form too), and repo-wide is simpler to reason about than chasing every future
+# golden fixture individually. This does change the checked-out bytes of vendor-src files,
+# which changes their hashFiles()-based cache key in the solvers CI job — that is a known,
+# accepted one-time cold rebuild, not a correctness risk.
+* text=auto eol=lf

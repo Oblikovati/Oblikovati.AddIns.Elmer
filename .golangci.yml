@@ -1,0 +1,92 @@
+version: "2"
+run:
+  tests: true
+linters:
+  default: none
+  enable:
+    - copyloopvar
+    - errcheck
+    - forbidigo
+    - funlen
+    - gocritic
+    - gocyclo
+    - govet
+    - ineffassign
+    - misspell
+    - nakedret
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print.*$
+          msg: use log/slog for diagnostics; user-facing CLI text belongs in cmd/ output helpers
+    funlen:
+      lines: 30
+      statements: 20
+    gocyclo:
+      min-complexity: 12
+    revive:
+      rules:
+        - name: exported
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - dupl
+          - forbidigo
+          - funlen
+          - gocyclo
+          - unparam
+        path: _test\.go
+      - linters:
+          - revive
+        text: stutters
+      # cmd/ drivers are live-diagnostic CLI tools (the bridge's equivalent of
+      # experiments/): printing to stdout is their whole job, each main() is a linear
+      # script, and they keep deliberately general helper signatures. Held to build/
+      # vet/format, not the heavier semantic linters.
+      - linters:
+          - errcheck
+          - forbidigo
+          - funlen
+          - gocritic
+          - gocyclo
+          - unparam
+        path: cmd/.*\.go
+      # hostcaller.go is cgo glue: gocritic's dupSubExpr false-positives on the cgo
+      # call wrapper, and Call is intentionally linear unsafe-pointer boilerplate.
+      - linters:
+          - funlen
+          - gocritic
+        path: hostcaller\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - vendor-src
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - oblikovati
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - vendor-src

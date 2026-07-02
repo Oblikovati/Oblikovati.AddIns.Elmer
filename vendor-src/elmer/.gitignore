@@ -1,0 +1,11 @@
+# Build/install output — sources are committed, everything below is rebuilt by
+# build.sh (top-level vendor-src/**/*.o|*.a|*.mod and vendor-src/*/build/ are
+# already covered by the repo-root .gitignore; this file covers what it misses).
+/install/
+/build.log
+
+# Smoke-test droppings. ResultOutputSolver writes the VTU under the mesh
+# directory (Header > Mesh DB in case.sif), not next to case.sif.
+test/mesh/case*.vtu
+test/solve.log
+test/ELMERSOLVER_STARTINFO

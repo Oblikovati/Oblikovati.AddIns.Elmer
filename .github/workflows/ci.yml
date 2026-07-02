@@ -1,0 +1,218 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # bash on every OS for consistent shell semantics (Windows' default pwsh
+    # mangles `gotestsum -- -coverprofile=...` and the inline build script).
+    shell: bash
+
+# The oblikovati-elmer add-in (module oblikovati.org/elmer). The SHIPPED c-shared
+# library links only the Apache-2.0 contract (oblikovati.org/api), pinned in go.mod to the
+# latest published API release. It is a sibling repo wired by the local
+# .github/actions/siblings composite (ADR-0018), which checks api out at the pinned release
+# so CI validates against exactly what ships. Add-in<->host integration tests (against the
+# GPL oblikovati.org module) are a future addition, not present in this repo today.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
+        with:
+          version: v2.1.0
+
+  # SPDX: every Go file in this GPL repo must carry GPL-2.0-only.
+  spdx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/add-spdx-headers.py --check
+
+  # Tier 1 — cgo-free unit tests on every OS. Add-in<->host integration tests (which would
+  # drive the live router/model) are a future addition; this job's CGO_ENABLED=0 across all
+  # three platforms is already how they'd run once they land, since the host's headless
+  # core is pure Go.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - run: go install gotest.tools/gotestsum@v1.12.0
+      - name: Test
+        run: gotestsum --junitfile test-results-${{ matrix.os }}.xml -- -coverprofile=coverage.out -covermode=count ./elmer/... ./gplpurity/...
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results-${{ matrix.os }}.xml
+
+  # Race detector needs cgo; Linux only. Runs the elmer package (the root c-shared
+  # package has no tests).
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - run: go test -race ./elmer/...
+
+  # Build the SHIPPED add-in: the cgo c-shared library (.so/.dll/.dylib) on every OS.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - name: Build c-shared library
+        run: |
+          EXT=so
+          [ "$RUNNER_OS" = "Windows" ] && EXT=dll
+          [ "$RUNNER_OS" = "macOS" ] && EXT=dylib
+          echo "building oblikovati-elmer.$EXT"
+          mkdir -p build
+          go build -buildmode=c-shared -o "build/oblikovati-elmer.$EXT" .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: oblikovati-elmer-${{ matrix.os }}
+          path: build/oblikovati-elmer.*
+
+  # Build the vendored solver toolchain from source — gmsh 4.13.1 (volume mesher) and
+  # ElmerSolver (multiphysics FEM, reference LAPACK/BLAS, no MPI/MUMPS/GUI) — and validate
+  # ElmerSolver against a known case: the hand-tessellated 5-tet cube under pure Z-tension
+  # with nu=0, whose max w-displacement is exact on ANY mesh (sigma*L/E = 1.0e-3 m). This
+  # is the self-contained, no-external-dependency toolchain the add-in ships and runs as
+  # subprocesses (vendor-src/{gmsh,elmer}/NOTICE.md).
+  # Linux is the gating platform for the from-source solver build (same rationale as the
+  # CalculiX add-in's solvers job, $CCX/.github/workflows/ci.yml): the macOS/Windows
+  # SHIPPED add-in (the cgo c-shared library) is still validated by the `build` job on
+  # all three OSes; building the vendored solver SOURCE on macOS is a follow-up.
+  solvers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - name: Install build toolchain
+        run: sudo apt-get update && sudo apt-get install -y gfortran cmake
+      # gmsh is the long pole cold (~7 min on the runner); ElmerSolver+lapack is ~8 min.
+      # Cache both build trees keyed on the exact content hash of their vendored sources,
+      # and on an exact-key hit SKIP that tool's build step entirely: a hit proves the
+      # cached binaries were built from byte-identical sources, and "rerun cmake --build
+      # incrementally against the warm tree" does NOT work — actions/checkout writes the
+      # sources with fresh mtimes, newer than the restored object files, so make recompiles
+      # everything (measured on run 28612820567: warm rebuilt 1523/1524 objects, same ~15
+      # min as cold). The cube smoke below still executes the (restored or fresh)
+      # ElmerSolver on every run, so a corrupt cache cannot pass silently.
+      #
+      # Split restore/save (rather than the combined actions/cache@v4 action): the combined
+      # action saves on job end unconditionally, including when the build step fails — that
+      # would poison the exact content-hash key with a partial/corrupt build tree, and every
+      # later run would restore that corruption. Saving only after a successful build (and
+      # only on a cache miss, so we don't redundantly re-save an exact-key hit) keeps the
+      # cache always representing a build that actually succeeded.
+      - name: Restore vendored gmsh build cache
+        id: restore-gmsh-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: vendor-src/gmsh/build
+          key: gmsh-build-${{ runner.os }}-${{ hashFiles('vendor-src/gmsh/**') }}
+      - name: Restore vendored ElmerSolver build cache
+        id: restore-elmer-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vendor-src/elmer/lapack/*.a
+            vendor-src/elmer/build
+            vendor-src/elmer/install
+          key: elmer-build-${{ runner.os }}-${{ hashFiles('vendor-src/elmer/**') }}
+      # These two steps are `make build-solvers` split per tool so each half can be
+      # skipped independently on its own exact-key cache hit (see the comment above).
+      - name: Build vendored gmsh
+        id: build-gmsh
+        if: steps.restore-gmsh-cache.outputs.cache-hit != 'true'
+        run: vendor-src/gmsh/build.sh
+      - name: Build vendored ElmerSolver
+        id: build-elmer
+        if: steps.restore-elmer-cache.outputs.cache-hit != 'true'
+        run: vendor-src/elmer/build.sh
+      - name: Validate ElmerSolver solves the 5-tet cube (peak w must equal 1.0e-3 m)
+        run: vendor-src/elmer/test/run.sh
+      # Fail loudly, not silently, if either vendored binary is missing or not executable —
+      # e.g. a corrupt/partial cache restore. Without this, the oracle tests below would
+      # just skip (requireElmerAndGmsh is designed to skip when a binary can't be resolved,
+      # which is the right behavior for a plain local `go test`), and the job would report
+      # green having exercised nothing.
+      - name: Verify vendored solver binaries are executable
+        env:
+          OBK_ELMER_BIN: ${{ github.workspace }}/vendor-src/elmer/install/bin/ElmerSolver
+          OBK_GMSH_BIN: ${{ github.workspace }}/vendor-src/gmsh/build/gmsh
+        run: |
+          test -x "$OBK_ELMER_BIN" || { echo "::error::OBK_ELMER_BIN not executable: $OBK_ELMER_BIN" >&2; exit 1; }
+          test -x "$OBK_GMSH_BIN" || { echo "::error::OBK_GMSH_BIN not executable: $OBK_GMSH_BIN" >&2; exit 1; }
+      # The oracle tests (elmer/oracle_solvers_test.go, landed Task 13) drive the real
+      # vendored gmsh + ElmerSolver through the full pipeline and assert against closed-form
+      # analytic results — the permanent physics gate for this add-in's M1 pipeline.
+      - name: Tag-gated solver oracle tests
+        env:
+          OBK_ELMER_BIN: ${{ github.workspace }}/vendor-src/elmer/install/bin/ElmerSolver
+          OBK_GMSH_BIN: ${{ github.workspace }}/vendor-src/gmsh/build/gmsh
+        run: go test ./... -tags solvers
+      - name: Save vendored gmsh build cache
+        if: steps.build-gmsh.outcome == 'success' && steps.restore-gmsh-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vendor-src/gmsh/build
+          key: ${{ steps.restore-gmsh-cache.outputs.cache-primary-key }}
+      - name: Save vendored ElmerSolver build cache
+        if: steps.build-elmer.outcome == 'success' && steps.restore-elmer-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            vendor-src/elmer/lapack/*.a
+            vendor-src/elmer/build
+            vendor-src/elmer/install
+          key: ${{ steps.restore-elmer-cache.outputs.cache-primary-key }}
+      - uses: actions/upload-artifact@v6
+        with:
+          name: solvers-linux
+          path: |
+            vendor-src/gmsh/build/gmsh
+            vendor-src/elmer/install/

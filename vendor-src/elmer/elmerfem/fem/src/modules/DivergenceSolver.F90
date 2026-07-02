@@ -1,0 +1,291 @@
+!/*****************************************************************************/
+! *
+! *  Elmer, A Finite Element Software for Multiphysical Problems
+! *
+! *  Copyright 1st April 1995 - , CSC - IT Center for Science Ltd., Finland
+! * 
+! *  This library is free software; you can redistribute it and/or
+! *  modify it under the terms of the GNU Lesser General Public
+! *  License as published by the Free Software Foundation; either
+! *  version 2.1 of the License, or (at your option) any later version.
+! *
+! *  This library is distributed in the hope that it will be useful,
+! *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+! *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+! *  Lesser General Public License for more details.
+! * 
+! *  You should have received a copy of the GNU Lesser General Public
+! *  License along with this library (in file ../LGPL-2.1); if not, write 
+! *  to the Free Software Foundation, Inc., 51 Franklin Street, 
+! *  Fifth Floor, Boston, MA  02110-1301  USA
+! *
+! *****************************************************************************/
+!/******************************************************************************
+! *
+! *  Authors: Peter Råback
+! *  Email:   Peter.Raback@csc.fi
+! *  Web:     http://www.csc.fi/elmer
+! *  Address: CSC - IT Center for Science Ltd.
+! *           Keilaranta 14
+! *           02101 Espoo, Finland 
+! *
+! *  Original Date: 14.02.2008
+! *
+! *****************************************************************************/
+
+
+!------------------------------------------------------------------------------
+!> Subroutine computes the divergence of vector fields using Galerkin method. 
+!> \ingroup Solvers
+!------------------------------------------------------------------------------
+SUBROUTINE DivergenceSolver( Model,Solver,dt,Transient )
+!------------------------------------------------------------------------------
+
+  USE CoordinateSystems
+  USE DefUtils
+
+  IMPLICIT NONE
+!------------------------------------------------------------------------------
+  TYPE(Model_t)  :: Model
+  TYPE(Solver_t), TARGET :: Solver
+  LOGICAL ::  Transient
+  REAL(KIND=dp) :: dt
+!------------------------------------------------------------------------------
+!    Local variables
+!------------------------------------------------------------------------------
+  TYPE(ValueList_t),POINTER :: SolverParams
+  CHARACTER(LEN=MAX_NAME_LEN) :: VarName, CondName
+  INTEGER :: i,j,dim,DOFs
+  LOGICAL :: ConstantBulkMatrix, ConstantBulkMatrixInUse, CSymmetry
+  LOGICAL :: GotIt, GotCoeff, Relative, Visited = .FALSE.
+  REAL(KIND=dp) :: Norm
+  REAL(KIND=dp) :: at0,at1,at2
+  TYPE(Variable_t), POINTER :: DivergenceSol
+  
+  SAVE Visited
+ 
+  CALL Info( 'DivergenceSolver', '-------------------------------------',Level=4 )
+  CALL Info( 'DivergenceSolver','Computing the divergence field',Level=4 )
+  CALL Info( 'DivergenceSolver', '-------------------------------------',Level=4 )
+
+  dim = CoordinateSystemDimension()
+!------------------------------------------------------------------------------
+!    Get variables needed for solution
+!------------------------------------------------------------------------------
+
+  SolverParams => GetSolverParams()
+  DivergenceSol => Solver % Variable
+
+  IF( ASSOCIATED(DivergenceSol)) THEN
+    IF ( COUNT( Solver % Variable % Perm > 0 ) <= 0 ) THEN
+      CALL Warn('DivergenceSolver','Size is zero, nothing to compute')
+      RETURN
+    END IF
+    IF ( .NOT. ASSOCIATED( Solver % Matrix ) ) THEN
+      CALL Warn('DivergenceSolver','No matrix associated, exiting')
+      RETURN
+    END IF
+    Dofs = DivergenceSol % DOFs
+    IF(Dofs /= 1) CALL Fatal('DivergenceSolver','Divergence should have 1 component')
+  ELSE
+     CALL Fatal('DivergenceSolver','Variable does not exist!')      
+  END IF
+
+  CSymmetry = CurrentCoordinateSystem() == AxisSymmetric .OR. &
+       CurrentCoordinateSystem() == CylindricSymmetric
+
+  VarName = GetString(SolverParams,'Divergence Variable',GotIt )
+  IF(.NOT. GotIt) VarName = GetString(SolverParams,'Target Variable',GotIt )
+  IF(.NOT. gotIt) VarName = 'Velocity'
+
+  ! For future use
+  CondName = ListGetString(SolverParams,'Divergence Coefficient',GotCoeff )
+  
+  at0 = RealTime()
+  
+  ConstantBulkMatrix = GetLogical( SolverParams, 'Constant Bulk Matrix', GotIt )
+  ConstantBulkMatrixInUse = ConstantBulkMatrix .AND. &
+      ASSOCIATED(Solver % Matrix % BulkValues)
+
+  Relative = ListGetLogical(SolverParams,'Relative Divergence',GotIt)
+  
+  CALL DefaultInitialize(Solver, ConstantBulkMatrixInUse)
+
+  CALL BulkAssembly()
+  IF ( ConstantBulkMatrix ) THEN
+    CALL DefaultFinishBulkAssembly(BulkUpdate = .NOT.ConstantBulkMatrixInUse, RHSUpdate = .FALSE.)
+  ELSE
+    CALL DefaultFinishBulkAssembly()
+  END IF
+
+  CALL DefaultFinishAssembly()
+  CALL DefaultDirichletBCs()
+
+  at1 = RealTime()
+  WRITE(Message,* ) 'Assembly Time: ',at1-at0
+  CALL Info( 'DivergenceSolver', Message, Level=5 )
+        
+!------------------------------------------------------------------------------     
+
+  Norm = DefaultSolve()
+
+!------------------------------------------------------------------------------     
+  
+  at2 = RealTime()
+  WRITE(Message,* ) 'Solution Time: ',at2-at1
+  CALL Info( 'DivergenceSolver', Message, Level=5 )
+  
+  WRITE( Message, * ) 'Result Norm: ',Norm
+  CALL Info( 'DivergenceSolver', Message, Level=4 )
+  
+CONTAINS
+
+
+!------------------------------------------------------------------------------
+  SUBROUTINE BulkAssembly()
+!------------------------------------------------------------------------------
+       
+    INTEGER :: elem,t,i,j,p,q,n,nd, Rank
+    REAL(KIND=dp), ALLOCATABLE :: STIFF(:,:), FORCE(:)
+    TYPE(GaussIntegrationPoints_t), TARGET :: IntegStuff
+    TYPE(Nodes_t) :: Nodes
+    TYPE(Element_t), POINTER :: Element
+    REAL(KIND=dp) :: weight,detJ,Source,x,vabs,velo(3)
+    REAL(KIND=dp), ALLOCATABLE :: Basis(:), dBasisdx(:,:)
+    REAL(KIND=dp), ALLOCATABLE :: Vx(:), Vy(:), Vz(:), Coeff(:)
+    LOGICAL :: Found
+    TYPE(ValueList_t), POINTER :: Material
+    
+    SAVE Coeff, Nodes
+    
+    n = MAX( Solver % Mesh % MaxElementDOFs, Solver % Mesh % MaxElementNodes )
+    ALLOCATE( STIFF(n,n), FORCE(n), Coeff(n) )
+    ALLOCATE( Vx(n), Vy(n), Vz(n), Basis(n), dBasisdx(n,3) )
+
+    DO elem = 1,Solver % NumberOFActiveElements
+         
+      ! Element information
+      ! ---------------------
+      Element => GetActiveElement(elem)
+      CALL GetElementNodes( Nodes )
+      nd = GetElementNOFDOFs()
+      n  = GetElementNOFNodes()
+
+!      IF(GotCoeff) Coeff(1:n) = GetReal( GetMaterial(), Coeff, CondName, Found )
+
+      CALL GetScalarLocalSolution( Vx, ComponentName(VarName,1) )
+      CALL GetScalarLocalSolution( Vy, ComponentName(VarName,2) )
+      IF(dim == 3) CALL GetScalarLocalSolution( Vz, ComponentName(VarName,3) )
+
+      IF( Relative ) THEN        
+        Velo(1) = SUM( Vx(1:nd) ) / nd
+        Velo(2) = SUM( Vy(1:nd) ) / nd
+        IF(dim==3) Velo(3) = SUM( Vz(1:nd) ) / nd
+        Vabs = MAX( SQRT( SUM( Velo(1:dim)**2 ) ), EPSILON( Vabs ) )
+      END IF
+        
+      IntegStuff = GaussPoints( Element )
+      STIFF  = 0.0_dp
+      FORCE  = 0.0_dp
+      
+      DO t=1,IntegStuff % n
+        Found = ElementInfo( Element, Nodes, IntegStuff % u(t), &
+                IntegStuff % v(t), IntegStuff % w(t), detJ, Basis, dBasisdx )
+        
+        Weight = IntegStuff % s(t) * detJ
+        IF ( CSymmetry ) THEN
+          x = SUM( Basis(1:n) * Nodes % x(1:n) ) 
+          Weight = Weight * x
+        END IF
+        
+        IF ( .NOT. ConstantBulkMatrixInUse ) THEN
+          DO p=1,nd
+            DO q=1,nd
+              STIFF(p,q) = STIFF(p,q) + Weight * Basis(q) * Basis(p)
+            END DO
+          END DO
+        END IF
+        
+        Source = SUM( dBasisdx(1:nd,1) * Vx(1:nd) )
+        Source = Source + SUM( dBasisdx(1:nd,2) * Vy(1:nd) )
+        IF(DIM == 3) Source = Source + SUM( dBasisdx(1:nd,3) * Vz(1:nd) )
+
+	IF( CSymmetry ) THEN
+          Source = Source + SUM( Basis(1:nd) * Vx(1:nd) ) / x
+        END IF
+        IF( Relative ) Source = Source / vabs
+
+        FORCE(1:nd) = FORCE(1:nd) + Basis(1:nd) * Weight * Source
+      END DO
+      
+!------------------------------------------------------------------------------
+!      Update global matrices from local matrices 
+!------------------------------------------------------------------------------
+
+      IF ( .NOT. ConstantBulkMatrixInUse ) THEN
+        CALL DefaultUpdateEquations( STIFF, FORCE(1:nd) )
+      ELSE
+        CALL DefaultUpdateForce( FORCE(1:nd) )        
+      END IF
+    END DO
+    
+    DEALLOCATE( STIFF, FORCE, Basis, dBasisdx, Coeff, Vx, Vy, Vz )
+
+!------------------------------------------------------------------------------
+  END SUBROUTINE BulkAssembly
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+END SUBROUTINE DivergenceSolver
+!------------------------------------------------------------------------------
+
+
+
+!------------------------------------------------------------------------------
+!> Initialization for the primary solver, i.e. DivergenceSolver.
+!> \ingroup Solvers
+!------------------------------------------------------------------------------
+  SUBROUTINE DivergenceSolver_Init( Model,Solver,dt,Transient )
+!------------------------------------------------------------------------------
+    USE DefUtils
+    IMPLICIT NONE
+
+    TYPE(Model_t)  :: Model
+    TYPE(Solver_t) :: Solver
+    REAL(KIND=dp) :: DT
+    LOGICAL :: Transient
+!------------------------------------------------------------------------------
+    TYPE(ValueList_t), POINTER :: SolverParams
+    INTEGER :: dim
+    CHARACTER(LEN=MAX_NAME_LEN) :: VarName, DivName
+    LOGICAL :: GotIt
+!------------------------------------------------------------------------------
+    SolverParams => GetSolverParams()
+    dim = CoordinateSystemDimension()
+
+    VarName = GetString(SolverParams,'Divergence Variable',GotIt )
+    IF(gotIt) THEN
+      DivName = 'Div '//TRIM(VarName)
+    ELSE
+      DivName = 'Divergence'
+    END IF
+
+    IF ( .NOT. ListCheckPresent( SolverParams,'Variable') ) THEN
+      CALL ListAddInteger( SolverParams, 'Variable DOFs', 1 )
+      CALL ListAddString( SolverParams, 'Variable', DivName )
+    END IF
+    CALL ListAddInteger( SolverParams, 'Time derivative order', 0 )
+
+    ! Add linear system defaults: cg+ILU0
+    CALL ListAddNewString(SolverParams,'Linear System Solver','Iterative')
+    CALL ListAddNewString(SolverParams,'Linear System Iterative Method','cg')
+    CALL ListAddNewString(SolverParams,'Linear System Preconditioning','ILU0')
+    
+    CALL ListAddNewInteger(SolverParams,'Linear System Max Iterations',500)
+    CALL ListAddNewConstReal(SolverParams,'Linear System Convergence Tolerance',1.0e-8_dp)
+
+!------------------------------------------------------------------------------
+  END SUBROUTINE DivergenceSolver_Init
+!------------------------------------------------------------------------------
+

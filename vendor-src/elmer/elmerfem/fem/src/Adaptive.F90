@@ -1,0 +1,3640 @@
+!/*****************************************************************************/
+! *
+! *  Elmer, A Finite Element Software for Multiphysical Problems
+! *
+! *  Copyright 1st April 1995 - , CSC - IT Center for Science Ltd., Finland
+! * 
+! *  This library is free software; you can redistribute it and/or
+! *  modify it under the terms of the GNU Lesser General Public
+! *  License as published by the Free Software Foundation; either
+! *  version 2.1 of the License, or (at your option) any later version.
+! *
+! *  This library is distributed in the hope that it will be useful,
+! *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+! *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+! *  Lesser General Public License for more details.
+! * 
+! *  You should have received a copy of the GNU Lesser General Public
+! *  License along with this library (in file ../LGPL-2.1); if not, write 
+! *  to the Free Software Foundation, Inc., 51 Franklin Street, 
+! *  Fifth Floor, Boston, MA  02110-1301  USA
+! *
+! *****************************************************************************/
+!
+!/******************************************************************************
+! *
+! *  Authors: Juha Ruokolainen, Mikko Lyly
+! *  Email:   Juha.Ruokolainen@csc.fi, Mikko.Lyly@csc.fi
+! *  Web:     http://www.csc.fi/elmer
+! *  Address: CSC - IT Center for Science Ltd.
+! *           Keilaranta 14
+! *           02101 Espoo, Finland 
+! *
+! *  Original Date: Autumn 2000
+! *
+! *****************************************************************************/
+
+!> \ingroup ElmerLib 
+!> \{
+
+!--------------------------------------------------------------------------------------------------------
+!> Module for adaptive meshing routines. The adaptivity is based on solver-specific error indicators that
+!> are used to create a field with the desired mesh density. This may be used by some mesh generators to
+!> create a more optimal mesh. 
+!--------------------------------------------------------------------------------------------------------
+MODULE Adaptive
+
+  USE GeneralUtils
+  USE SolverUtils, ONLY : VectorValuesRange
+  USE ElementUtils, ONLY : ElementArea
+  USE ModelDescription
+  USE MeshUtils, ONLY : AllocateMesh, AllocatePDefinitions, FindMeshEdges, &
+      LoadMesh2, MeshStabParams, PrepareMesh, ReleaseMesh, &
+      ReleaseMeshEdgeTables, ReleaseMeshFaceTables, SetActiveElementsTable, &
+      SetCurrentMesh, TransferCoordAndTime, UpdateSolverMesh, WriteMeshToDisk, &
+      WriteMeshToDisk2
+  USE MeshRemeshing
+  USE SaveUtils, ONLY : SaveGmshOutput
+  USE DefUtils, ONLY: GetMaterial, GetReal, GetBodyForce, GetSolverParams, GetLogical, &
+      GetNofActive, GetActiveElement, GetElementNofBDOFs, GetBoundaryElement, &
+      ActiveBoundaryElement, GetNofBoundaryElements, GetElementFamily, GetElementNodes
+  USE ElementDescription, ONLY: GetEdgeMap, mGetElementDOFs
+  USE MainUtils, ONLY : AddEquationSolution
+  
+  IMPLICIT NONE
+
+  
+CONTAINS
+
+!------------------------------------------------------------------------------
+  SUBROUTINE RefineMesh( Model,Solver,Quant,Perm, &
+            InsideResidual, EdgeResidual, BoundaryResidual )
+!------------------------------------------------------------------------------
+    IMPLICIT NONE
+
+    TYPE( Model_t ) :: Model
+    TYPE(Solver_t), TARGET :: Solver
+    REAL(KIND=dp) :: Quant(:)
+    INTEGER :: Perm(:)
+
+    INTERFACE
+       SUBROUTINE BoundaryResidual( Model,Edge,Mesh,Quant,Perm,Gnorm,Indicator )
+          USE Types
+          TYPE(Element_t), POINTER :: Edge
+          TYPE(Model_t) :: Model
+          TYPE(Mesh_t), POINTER :: Mesh
+          REAL(KIND=dp) :: Quant(:), Indicator(2), Gnorm
+          INTEGER :: Perm(:)
+       END SUBROUTINE BoundaryResidual
+
+
+       SUBROUTINE EdgeResidual( Model,Edge,Mesh,Quant,Perm, Indicator)
+          USE Types
+          TYPE(Element_t), POINTER :: Edge
+          TYPE(Model_t) :: Model
+          TYPE(Mesh_t), POINTER :: Mesh
+          REAL(KIND=dp) :: Quant(:), Indicator(2)
+          INTEGER :: Perm(:)
+       END SUBROUTINE EdgeResidual
+
+
+       SUBROUTINE InsideResidual( Model,Element,Mesh,Quant,Perm,Fnorm, Indicator)
+          USE Types
+          TYPE(Element_t), POINTER :: Element
+          TYPE(Model_t) :: Model
+          TYPE(Mesh_t), POINTER :: Mesh
+          REAL(KIND=dp) :: Quant(:), Indicator(2), Fnorm
+          INTEGER :: Perm(:)
+       END SUBROUTINE InsideResidual
+    END INTERFACE
+!------------------------------------------------------------------------------
+
+    TYPE(Mesh_t), POINTER :: RefMesh, NewMesh, Mesh, sMesh
+    TYPE( Nodes_t ) :: Nodes
+    TYPE(Solver_t), POINTER :: SolverPtr
+    INTEGER, POINTER :: Permutation(:)
+    LOGICAL, POINTER :: EdgeSplitted(:)
+    INTEGER, POINTER :: Referenced(:)
+    TYPE( Element_t ), POINTER :: RefElement
+    INTEGER :: i,j,k,n,nn,MarkedElements
+    TYPE( Variable_t ), POINTER :: Var, Var1, NewVar, RTFlux
+    REAL(KIND=dp) :: MaxError, ErrorLimit, minH, maxH, MaxChangeFactor, &
+        LocalIndicator,ErrorEstimate,t,TotalTime,RemeshTime,s,FinalRef,&
+        MaxScale,AveScale,OutFrac,MaxFrac, NodalMaxError, mError, SolNorm
+
+    LOGICAL :: BandwidthOptimize, Found, Coarsening, &
+        MeshNumbering, DoFinalRef
+    INTEGER :: MaxDepth, MinDepth, NLen, MeshDim
+    CHARACTER(:), ALLOCATABLE :: Path, VarName
+    REAL(KIND=dp), POINTER  :: Time(:), NodalError(:), PrevValues(:), &
+         Hvalue(:), HValue1(:), PrevNodalError(:), PrevHValue(:), hConvergence(:), ptr(:), tt(:)
+    REAL(KIND=dp), POINTER  :: ErrorIndicator(:), eRef(:), hRef(:), Work(:)
+    LOGICAL :: AdaptiveInterp, Parallel, AdaptiveOutput, AdaptInit
+    LOGICAL :: WithRecovery, ConvCond
+    TYPE(ValueList_t), POINTER :: Params
+    CHARACTER(*), PARAMETER :: Caller = 'RefineMesh'
+    REAL(KIND=dp), POINTER :: Wrk(:,:)
+    REAL(KIND=dp) :: CoordScale(3)
+    
+    SAVE DoFinalRef
+    
+!---------------------------------------------------------------------------------
+!
+!   Initialize:
+!   -----------
+    CALL Info( Caller, ' ', Level=5 )
+    CALL Info( Caller, &
+        '----------- M E S H   R E F I N E M E N T --------------', Level=5 )
+    TotalTime = CPUTime()
+    RemeshTime = 0.0d0
+
+    RefMesh => Solver % Mesh
+
+    IF( RefMesh % DiscontMesh ) THEN
+      CALL Fatal(Caller,'Adaptive refinement not possible for discontinuous mesh!')
+    END IF
+
+    Params => Solver % Values
+    SolverPtr => Solver
+    
+    MinDepth = ListGetInteger( Params, 'Adaptive Min Depth', Found )
+
+    MaxDepth = ListGetInteger( Params, 'Adaptive Max Depth', Found )
+    IF (Found) THEN
+      IF ( Refmesh % AdaptiveDepth > MaxDepth ) THEN
+        ! Setting this flag will override convergence for this equation on steady-state level.
+        Solver % Mesh % AdaptiveFinished = .TRUE.
+        CALL Info( Caller,'Max adaptive depth reached! Doing nothing!', Level = 5 )
+        RETURN
+
+        IF( MinDepth > MaxDepth ) THEN
+          CALL Warn(Caller,'"Adaptive Min Depth" greater than Max!' )
+        END IF
+      END IF
+    END IF
+
+    AdaptInit = ( RefMesh % AdaptiveDepth == 0 ) 
+
+    IF( AdaptInit ) THEN
+      CALL Info(Caller,'Initializing stuff on the coarsest level!')
+      DoFinalRef = .FALSE.
+    END IF
+
+    IF( DoFinalRef ) THEN
+      CALL Info( Caller, 'Final refinement done. Nothing to do!', Level=6 )
+      RefMesh % OutputActive = .TRUE.      
+      RefMesh % Parent % OutputActive = .FALSE.      
+      CALL Info(Caller,'Setting adaptive restart to True!',Level=12)
+      RefMesh % AdaptiveFinished = .TRUE.
+      RETURN
+    ELSE
+      RefMesh % OutputActive = .TRUE.
+      RefMesh % AdaptiveFinished = .FALSE.
+    END IF
+        
+    
+    ! Interpolation is costly in parallel. Do it by default only in serial. 
+    Parallel = ( ParEnv % PEs > 1 )
+    AdaptiveInterp = ListGetLogical( Params,'Adaptive Interpolate',Found,DefValue=.TRUE. )
+!   IF(.NOT. Found) AdaptiveInterp = Parallel 
+    
+    AdaptiveOutput = ListGetLogical( Params,'Adaptive Output',Found )
+    
+    DO i=1,RefMesh % NumberOfBulkElements
+       RefMesh % Elements(i) % Splitted = 0
+    END DO
+
+!   Compute the local error indicators:
+!   -----------------------------------
+    t = CPUTime()
+    CALL AllocateVector( ErrorIndicator, RefMesh % NumberOfBulkElements )
+
+    WithRecovery = ListGetLogical(Params, 'Flux Recovery', Found) 
+    IF (WithRecovery) THEN
+      CALL FluxRecovery(Model, Solver, RefMesh, ErrorIndicator, MaxError)
+      RTFlux => VariableGet(RefMesh % Variables, 'RTFlux')
+    ELSE
+      MaxError = ComputeError( Model, ErrorIndicator, RefMesh, &
+          Quant, Perm, InsideResidual, EdgeResidual, BoundaryResidual )
+    END IF
+    !
+    !   Global error estimate:
+    !   ----------------------
+    ErrorEstimate = SUM( ErrorIndicator**2) 
+    IF (Parallel) ErrorEstimate = ParallelReduction(ErrorEstimate)
+    
+    IF (WithRecovery) THEN
+      ErrorEstimate =  SQRT(ErrorEstimate)
+    ELSE
+      n = SIZE(ErrorIndicator)
+      IF (Parallel) n = ParallelReduction(n)
+      ErrorEstimate =  SQRT( ErrorEstimate / n )
+    END IF
+    
+    WRITE( Message, * ) 'Error computation time (cpu-secs):               ',CPUTime()-t
+    CALL Info( Caller, Message, Level = 6 )
+    
+    IF(ListGetLogical(Params,'Adaptive Error Histogram',Found ) ) THEN
+      CALL ShowVectorHistogram(ErrorIndicator,SIZE(ErrorIndicator))
+    END IF
+    
+    WRITE( Message, * ) 'Max error      =                                 ',MaxError
+    CALL Info( Caller, Message, Level = 6 )
+    WRITE( Message, * ) 'Error estimate =                                 ',ErrorEstimate
+    CALL Info( Caller, Message, Level = 6 )
+    !WRITE(12,*) RefMesh % NumberOfBulkElements,ErrorEstimate,MaxError
+
+!
+!   Add nodal average of the h-value to the mesh variable list:
+!   -----------------------------------------------------------
+
+    nn = RefMesh % NumberOfNodes
+    Var => VariableGet( RefMesh % Variables, 'Hvalue', ThisOnly=.TRUE. )
+
+    IF ( ASSOCIATED( Var ) ) THEN
+      Hvalue => Var % Values
+      Var % PrimaryMesh => RefMesh
+      IF( AdaptInit ) Hvalue = 0.0_dp
+    ELSE
+      CALL AllocateVector( Hvalue, nn )
+
+      CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+          'Hvalue', 1, Hvalue, Output = AdaptiveOutput )       
+
+      Var => VariableGet( RefMesh % Variables, 'Hvalue', ThisOnly=.TRUE. )      
+      IF(.NOT. ASSOCIATED(Var) ) THEN
+        CALL Fatal(Caller,'Could not add variable Hvalue?')
+      END IF
+      Hvalue = 0.0d0
+    END IF
+
+    CALL AllocateVector( PrevHvalue, nn )
+    IF( AdaptInit ) THEN
+      PrevHValue(1:nn) = 0.0_dp
+    ELSE
+      PrevHvalue(1:nn) = Hvalue(1:nn)
+    END IF
+
+    CALL AllocateVector( Referenced, nn )
+
+    Hvalue = 0.0d0
+    Referenced = 0
+    n = RefMesh % MaxElementNodes
+    ALLOCATE( Nodes % x(n), Nodes % y(n), Nodes % z(n) )
+
+    ! Average nodal Hvalue from the bulk elements
+    DO i=1,RefMesh % NumberOfBulkElements
+       RefElement => RefMesh % Elements(i)
+       n = RefElement % TYPE % NumberOfNodes
+
+       Nodes % x(1:n) = RefMesh % Nodes % x(RefElement % NodeIndexes)
+       Nodes % y(1:n) = RefMesh % Nodes % y(RefElement % NodeIndexes)
+       Nodes % z(1:n) = RefMesh % Nodes % z(RefElement % NodeIndexes)
+       s = ElementDiameter( RefElement, Nodes )
+       DO j=1,n
+          k = RefMesh % Elements(i) % NodeIndexes(j)
+          Hvalue(k) = Hvalue(k) + s
+          Referenced(k) = Referenced(k) + 1
+       END DO
+    END DO
+
+    DEALLOCATE( Nodes % x, Nodes % y, Nodes % z )
+
+    WHERE( Referenced(1:nn) > 0 )
+      Hvalue(1:nn) = Hvalue(1:nn) / Referenced(1:nn)
+    END WHERE
+    CALL ParallelAverageHvalue(  RefMesh, Hvalue )
+    
+!   Add estimate of the convergence with respect to h:
+!  ----------------------------------------------------
+    Var => VariableGet( RefMesh % Variables, 'hConvergence', ThisOnly=.TRUE. )
+
+    IF ( ASSOCIATED( Var ) ) THEN
+      hConvergence => Var % Values
+      Var % PrimaryMesh => RefMesh
+      IF( AdaptInit ) hConvergence = 1.0_dp
+    ELSE
+      CALL AllocateVector( hConvergence, nn )
+      hConvergence = 1.0d0
+      CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+          'hConvergence', 1, hConvergence, Output=AdaptiveOutput )
+      Var => VariableGet( RefMesh % Variables, 'hConvergence', ThisOnly=.TRUE. )
+    END IF
+
+!   Add nodal average of the computed estimate for the
+!   solution error to the mesh variable list:
+!   --------------------------------------------------
+    VarName = GetVarName(Solver % Variable)
+    nlen = LEN_TRIM(VarName)
+    Var => VariableGet( RefMesh % Variables, &
+         VarName(1:nlen)  // '.error', ThisOnly=.TRUE. )
+
+    IF ( ASSOCIATED( Var ) ) THEN
+       NodalError  => Var % Values
+       Var % PrimaryMesh => RefMesh
+    ELSE
+       CALL AllocateVector( NodalError, nn )
+       CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+          VarName(1:nlen) // '.error', 1, NodalError )
+    END IF
+
+    Var => VariableGet( RefMesh % Variables, &
+         VarName(1:nlen) // '.perror', ThisOnly=.TRUE. )
+
+    IF ( ASSOCIATED( Var ) ) THEN
+      PrevNodalError  => Var % Values
+      Var % PrimaryMesh => RefMesh
+      IF(AdaptInit) PrevNodalError = 0.0_dp
+    ELSE
+      CALL AllocateVector( PrevNodalError, RefMesh % NumberOfNodes )
+      PrevNodalError = 0.0d0
+      CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+          VarName(1:nlen) // '.perror', 1, PrevNodalError, Output=AdaptiveOutput)
+    END IF
+
+    NodalError = 0.0d0
+    Referenced = 0
+    DO i = 1, RefMesh % NumberOfBulkElements
+       DO j=1,RefMesh % Elements(i) % TYPE % NumberOfNodes
+          k = RefMesh % Elements(i) % NodeIndexes(j)
+          Referenced(k) = Referenced(k) + 1
+          NodalError(k) = NodalError(k) + ErrorIndicator(i)
+       END DO
+    END DO
+
+    WHERE( Referenced(1:nn) > 0 )
+       NodalError(1:nn) = NodalError(1:nn) / Referenced(1:nn)
+    END WHERE
+
+    IF (ParEnv % PEs>1) THEN
+      CALL ParallelAverageHvalue(  RefMesh, NodalError )
+
+      NodalMaxError = ParallelReduction( MAXVAL(NodalError),2 )
+      WRITE( Message, * ) 'Nodal Max error      =                           ',NodalMaxError
+      CALL Info( Caller, Message, Level = 6 )
+    END IF
+
+!
+!   Smooth error, if requested:
+!   ---------------------------
+    k = ListGetInteger( Params, 'Adaptive Pre Smoothing', Found )
+    IF ( Found .AND. k > 0 ) THEN 
+       CALL AllocateVector( eRef, nn )
+       DO j=1,k
+          eRef(1:nn) = NodalError(1:nn)
+          Referenced = 0
+          NodalError = 0
+          DO i=1,RefMesh % NumberOfBulkElements
+             n = RefMesh % Elements(i) % TYPE % NumberOfNodes
+             NodalError(RefMesh % Elements(i) % NodeIndexes) = &
+                NodalError(RefMesh % Elements(i) % NodeIndexes) + &
+                   SUM( eRef(RefMesh % Elements(i) % NodeIndexes) ) / n
+             Referenced( RefMesh % Elements(i) % NodeIndexes ) = &
+                Referenced( RefMesh % Elements(i) % NodeIndexes ) + 1
+          END DO
+          WHERE( Referenced(1:nn) > 1 )
+             NodalError(1:nn) = NodalError(1:nn) / Referenced(1:nn)
+          END WHERE
+       END DO
+       DEALLOCATE( eRef )
+    END IF
+
+    DEALLOCATE( Referenced )
+!
+!   Add reference error to variable list:
+!   -------------------------------------
+    Var => VariableGet( RefMesh % Variables, &
+         VarName(1:nlen) // '.eRef', ThisOnly=.TRUE. )
+
+    IF ( ASSOCIATED( Var ) ) THEN
+      eRef => Var % Values
+      Var % PrimaryMesh => RefMesh
+      IF( AdaptInit ) eRef(1:nn) = NodalError(1:nn)
+    ELSE
+      CALL AllocateVector( eRef, nn )
+      eRef(1:nn) = NodalError(1:nn)      
+      CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+          VarName(1:nlen) // '.eRef',1,eRef, Output=AdaptiveOutput )
+    END IF
+!
+!   Mesh projection may alter the values somewhat!
+!   ----------------------------------------------
+    eRef = MAX( eRef, 1.0d-12 )
+
+!
+!   Add reference h to variable list:
+!   ---------------------------------
+    Var => VariableGet( RefMesh % Variables, 'hRef', ThisOnly=.TRUE. )
+
+    IF ( ASSOCIATED( Var ) ) THEN
+      hRef => Var % Values
+      Var % PrimaryMesh => RefMesh
+      IF( AdaptInit ) hRef(1:nn) = Hvalue(1:nn)
+    ELSE
+      CALL AllocateVector( hRef, nn )
+      hRef(1:nn) = Hvalue(1:nn)
+      CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+          'hRef', 1, hRef, Output=AdaptiveOutput)
+    END IF
+!
+!   Mesh projection may alter the values somewhat!
+!   ----------------------------------------------
+    hRef = MAX( hRef, 1.0d-12 )
+
+!   Check for convergence:
+!   ----------------------
+    ErrorLimit = ListGetConstReal( Params,'Adaptive Error Limit', Found )
+    IF ( .NOT.Found ) ErrorLimit = 0.5d0
+    IF (WithRecovery) THEN
+      ConvCond = ErrorEstimate < ErrorLimit
+      n = SIZE(ErrorIndicator)
+      IF (Parallel) n = ParallelReduction(n)
+      ! The target element error if the error were evenly distributed:
+      ErrorLimit =  ErrorLimit / SQRT(REAL(n))
+    END IF
+
+    MaxScale = ListGetConstReal( Params,'Adaptive Max Error Scale', Found )
+    IF(.NOT. Found) MaxScale = 1.0_dp
+
+    AveScale = ListGetConstReal( Params,'Adaptive Average Error Scale', Found )
+    IF(.NOT. Found) AveScale = 1.0_dp
+
+    MaxFrac = ListGetConstReal( Params,'Adaptive Max Outlier Fraction',Found ) 
+    IF( Found ) THEN
+      OutFrac = OutlierFraction(ErrorIndicator,SIZE(ErrorIndicator),ErrorLimit)     
+      WRITE( Message, * ) 'Outlier frac.  =                                 ',OutFrac
+      CALL Info( Caller, Message, Level = 6 )
+    ELSE
+      ! Just make values that are omitted
+      MaxFrac = 1.0_dp
+      OutFrac = 0.0_dp
+    END IF
+            
+    !PRINT *,'Check for convergence:'
+    !PRINT *,'MaxError, MaxScale*ErrorLimit:', MaxError,MaxScale*ErrorLimit 
+    !PRINT *,'MaxError < MaxScale*ErrorLimit :', MaxError < MaxScale*ErrorLimit
+    !PRINT *,'ErrorEstimate, AveScale*ErrorLimit', ErrorEstimate, AveScale*ErrorLimit
+    !PRINT *,'ErrorEstimate < AveScale*ErrorLimit', ErrorEstimate < AveScale*ErrorLimit
+    !PRINT *,'OutFrac:',OutFrac,MaxFrac, OutFrac < MaxFrac
+    !PRINT *,'Depth:',RefMesh % AdaptiveDepth, MinDepth
+    
+    IF( RefMesh % AdaptiveDepth > MinDepth ) THEN
+      mError = MaxError
+      IF(ListGetLogical(Params, 'Adaptive Use Nodal Error As Limit', Found)) mError = NodalMaxError
+      IF (.NOT. WithRecovery) THEN
+        ConvCond = ErrorEstimate < AveScale * ErrorLimit
+      END IF
+        
+      IF ( mError < MaxScale * ErrorLimit .AND. ConvCond .AND. OutFrac < MaxFrac ) THEN
+        FinalRef = ListGetConstReal( Params,'Adaptive Final Refinement', DoFinalRef ) 
+        IF(DoFinalRef ) THEN      
+          CALL Info( Caller, 'Performing one final refinement',Level=6)
+          ErrorLimit = FinalRef * ErrorLimit 
+        ELSE
+          CALL Info( Caller, 'Mesh convergence limit reached. Nothing to do!', Level=6 )
+          RefMesh % Parent % OutputActive = .FALSE.      
+          RefMesh % AdaptiveFinished = .TRUE.
+          IF (WithRecovery) RTFlux % SteadyConverged = 1 
+          GOTO 10
+        END IF
+      END IF
+    END IF
+
+!
+!   Get additional parameters:
+!   --------------------------
+    minH = ListGetConstReal( Params, 'Adaptive Min H', Found )
+    maxH = ListGetConstReal( Params, 'Adaptive Max H', Found )
+
+    MaxChangeFactor = ListGetConstReal( Params, &
+            'Adaptive Max Change', Found )
+    IF ( .NOT.Found .OR. MaxChangeFactor <= AEPS ) MaxChangeFactor = 3.0d0
+
+    Coarsening = ListGetLogical( Params, 'Adaptive Coarsening', Found )
+    IF( .NOT.Found ) Coarsening = .TRUE.
+!
+!   Compute local convergence of the solution with respect to h:
+!   ------------------------------------------------------------
+
+    WHERE( eRef(1:nn) > 0 )
+      PrevNodalError(1:nn) = PrevNodalError(1:nn) + &
+         LOG( HValue(1:nn) / hRef(1:nn) ) * LOG( NodalError(1:nn) / eRef(1:nn) )
+    END WHERE
+    CALL ParallelAverageHvalue(  RefMesh, PrevNodalError )
+
+    PrevHvalue(1:nn) = PrevHvalue(1:nn) + LOG( HValue(1:nn) / hRef(1:nn) )**2
+    CALL ParallelAverageHvalue(  RefMesh, PrevHvalue )
+
+    IF ( RefMesh % AdaptiveDepth > 0 ) THEN
+       WHERE( PrevHValue(1:nn) > 0 )
+          hConvergence(1:nn)  = MAX( PrevNodalError(1:nn) / PrevHValue(1:nn), 0.25d0 )
+       ELSEWHERE
+          hConvergence(1:nn)  = 0.25d0
+       END WHERE
+    END IF
+    CALL ParallelAverageHvalue(  RefMesh, hConvergence )
+
+!   Generate the new mesh:
+!   ----------------------
+    IF ( ListGetLogical( Params, 'Adaptive Remesh', Found ) ) THEN
+      t = RealTime()
+      IF( ListGetLogical( Params,'Adaptive Remesh Use MMG', Found ) ) THEN
+#ifdef HAVE_MMG
+        CALL Info(Caller,'Using MMG library for mesh refinement', Level=5)        
+        NewMesh => MMG_ReMesh( RefMesh, ErrorLimit/3, HValue, &
+            NodalError, hConvergence, minH, maxH, MaxChangeFactor, Coarsening )         
+#else
+        CALL Fatal( Caller,'Remeshing requested with MMG but not compiled with!')
+#endif          
+      ELSE       
+        CALL Info(Caller,'Using file I/O for mesh refinement',Level=5)
+        NewMesh => External_ReMesh( RefMesh, ErrorLimit/3, HValue, &
+            NodalError, hConvergence, minH, maxH, MaxChangeFactor, Coarsening )
+      END IF
+      RemeshTime = RealTime() - t
+      WRITE( Message, * ) 'Remeshing time (real-secs):                      ',RemeshTime
+      CALL Info( Caller, Message, Level=6 )
+    ELSE
+      NewMesh => SplitMesh( RefMesh, ErrorIndicator, ErrorLimit, &
+          NodalError, Hvalue, hConvergence, minH, maxH, MaxChangeFactor )
+    END IF
+
+    Hvalue(1:nn) = PrevHValue(1:nn)
+!   NodalError = PrevNodalError
+
+    IF ( .NOT.ASSOCIATED( NewMesh ) ) THEN
+      CALL Info( Caller,'Current mesh seems fine. Nothing to do.', Level=6 )
+      IF (ASSOCIATED(RefMesh % Parent)) RefMesh % Parent % OutputActive = .FALSE.
+      IF (WithRecovery) RTFlux % SteadyConverged = 1
+      GOTO 10
+    ELSE
+      CALL PrepareMesh(Model, NewMesh, ParEnv % PEs>1)
+    END IF
+
+    CALL Info( Caller,'The new mesh consists of: ', Level=5 )
+    CALL Info( Caller,'Nodal points: '&
+        //TRIM(I2S(NewMesh % NumberOfNodes)),Level=5)
+    CALL Info( Caller,'Bulk elements: '&
+        //TRIM(I2S(NewMesh % NumberOfBulkElements)),Level=5)
+    CALL Info( Caller,'Boundary elements: '&
+        //TRIM(I2S(NewMesh % NumberOfBoundaryElements)),Level=5)
+
+!-------------------------------------------------------------------
+
+!   All the mesh geometry related tables are ready now,
+!   next we update model and solver related tables:
+!   ----------------------------------------------------
+
+    t = CPUTime()
+
+!   Add the new mesh to the global list of meshes:
+!   ----------------------------------------------
+    NewMesh % Next   => Model % Meshes 
+    Model % Meshes   => NewMesh
+    RefMesh % Child  => NewMesh
+    NewMesh % Parent => RefMesh
+    NewMesh % Child => NULL()
+
+    NewMesh % Name = ListGetString( Params, &
+         'Adaptive Mesh Name', Found )
+    IF ( .NOT. Found ) NewMesh % Name = 'RefinedMesh'
+
+    MeshNumbering = ListGetLogical( Params, &
+        'Adaptive Mesh Numbering', Found )
+    IF(.NOT. Found ) MeshNumbering = .TRUE.
+    
+    NewMesh % AdaptiveDepth = RefMesh % AdaptiveDepth + 1
+    IF( MeshNumbering ) THEN
+      NewMesh % Name = TRIM( NewMesh % Name ) // I2S(NewMesh % AdaptiveDepth)
+    END IF
+
+    IF ( ListGetLogical( Params, 'Adaptive Save Mesh', Found ) ) THEN 
+      Nlen = LEN_TRIM(OutputPath)
+      IF ( Nlen > 0 ) THEN
+        Path = OutputPath(1:Nlen) // '/' // TRIM(NewMesh % Name)
+      ELSE
+        Path = TRIM(NewMesh % Name)
+      END IF
+      CALL MakeDirectory( TRIM(path) // CHAR(0) )
+    
+      IF( ParEnv % PEs > 1 ) THEN
+        CALL WriteMeshToDisk2( Model, NewMesh, Path, ParEnv % MyPe )
+      ELSE
+        CALL WriteMeshToDisk( NewMesh, Path )
+      END IF
+    END IF
+    
+!   Initialize local variables for the new mesh:
+!   --------------------------------------------
+    NULLIFY( NewMesh % Variables )
+    
+    CALL TransferCoordAndTime( RefMesh, NewMesh ) 
+
+    IF (WithRecovery) THEN
+      ! The following calls SetCurrentMesh( CurrentModel, NewMesh ),
+      ! adds the variable of the solver so that its associated with
+      ! the new mesh
+      CALL UpdateSolverMesh( Solver, NewMesh, .TRUE. )
+      ! The following is needed so that the "variable loads" is also created
+      CALL AddEquationSolution(SolverPtr, Solver % TimeOrder > 0)
+    ELSE
+      CALL SetCurrentMesh( Model, NewMesh )
+    END IF
+    
+    ! Initialize the field variables for the new mesh. These are
+    ! interpolated from the old meshes variables. Vector variables
+    ! are in the variable lists in two ways: as vectors and as
+    ! vector components. We MUST update the vectors (i.e. DOFs>1)
+    ! first!!!!!
+    ! -----------------------------------------------------------
+    CALL Info(Caller,'Interpolate vectors from old mesh to new mesh!',Level=7)    
+    Var => RefMesh % Variables
+    DO WHILE( ASSOCIATED( Var ) )
+      ! This cycles global variable such as time etc. 
+      IF( SIZE( Var % Values ) == Var % DOFs ) THEN
+        Var => Var % Next
+        CYCLE
+      END IF
+
+      IF ( Var % DOFs > 1 ) THEN
+        NewVar => VariableGet( NewMesh % Variables,Var % Name,.FALSE. )
+        k = SIZE( NewVar % Values )
+        IF ( ASSOCIATED( NewVar % Perm ) ) THEN
+          k = COUNT( NewVar % Perm > 0 )
+        END IF
+        IF ( GetVarName( NewVar ) == 'flow solution' ) THEN
+          NewVar % Norm = 0.0d0
+          DO i=1,NewMesh % NumberOfNodes
+            DO j=1,NewVar % DOFs-1
+              NewVar % Norm = NewVar % Norm + &
+                  NewVar % Values( NewVar % DOFs*(i-1)+j )**2
+            END DO
+          END DO
+          NewVar % Norm = SQRT( NewVar % Norm / k )
+        ELSE
+          NewVar % Norm = SQRT( SUM(NewVar % Values**2) / k )
+        END IF
+      END IF
+      Var => Var % Next
+    END DO
+    CALL Info(Caller,'Interpolation to new mesh done!',Level=20)    
+
+!   Second time around, update scalar variables and
+!   vector components:
+!   -----------------------------------------------
+    CALL Info(Caller,'Interpolate scalars from old mesh to new mesh!',Level=7)    
+    Var => RefMesh % Variables
+    DO WHILE( ASSOCIATED( Var ) )
+
+      ! This cycles global variable such as time etc. 
+      IF( SIZE( Var % Values ) == Var % DOFs ) THEN
+        Var => Var % Next
+        CYCLE
+      END IF
+
+      SELECT CASE( Var % Name )
+
+      CASE( 'coordinate 1', 'coordinate 2', 'coordinate 3' )
+        CONTINUE
+
+      CASE('rtflux')
+        !
+        ! We skip the recovery variable
+        !
+        CONTINUE
+        
+      CASE DEFAULT
+        IF (WithRecovery .AND. Var % Name == Solver % Variable % Name .OR. &
+            WithRecovery .AND. Var % Name == Solver % Variable % Name // ' ' // 'loads') THEN
+          ! The variable of the solver should already exist, just check this:
+          NewVar => VariableGet( NewMesh % Variables, Var % Name, .TRUE., UnfoundFatal = .TRUE. )
+          IF (Var % Name == Solver % Variable % Name) THEN
+            NewVar % PrevNorm = Var % Norm
+          END IF
+        ELSE IF ( Var % DOFs == 1 ) THEN
+          
+          ! Skip the fields related to adaptivity since they are specific to each mesh 
+          Found = .FALSE.
+!          Found = Found .OR. INDEX( Var % Name, 'ave test' ) > 0 
+          Found = Found .OR. INDEX( Var % Name, '.error'  ) > 0
+          Found = Found .OR. INDEX( Var % Name, '.eref'   ) > 0
+          Found = Found .OR. INDEX( Var % Name, '.perror' ) > 0
+          IF ( Found ) THEN
+            k = Solver % Variable % NameLen
+            IF ( Var % Name(1:k) /= Solver % Variable % Name(1:k) ) THEN
+              Var => Var % Next
+              CYCLE
+            END IF
+          END IF
+
+          IF( .NOT. AdaptiveInterp ) THEN
+            ! Add field without interpolation
+            NewVar => VariableGet( NewMesh % Variables, Var % Name, .TRUE. )
+            IF(.NOT. ASSOCIATED(NewVar) ) THEN
+              CALL VariableAddVector( NewMesh % Variables, NewMesh, Solver,&
+                  Var % Name,Var % DOFs)
+              NewVar => VariableGet( NewMesh % Variables, Var % Name, .TRUE. )
+            END IF
+            NewVar % PrevNorm = Var % Norm
+          ELSE
+            ! Interpolate scalar variables using automatic internal interpolation 
+            NewVar => VariableGet( NewMesh % Variables, Var % Name, .FALSE. )
+            k = SIZE(NewVar % Values)
+            IF ( ASSOCIATED(NewVar % Perm) ) THEN
+              k = COUNT(NewVar % Perm > 0)
+            END IF
+            NewVar % Norm = SQRT(SUM(NewVar % Values**2)/k)
+          END IF
+        END IF
+      END SELECT
+      Var => Var % Next
+    END DO
+
+!-------------------------------------------------------------------    
+    WRITE( Message, * ) 'Mesh variable update time (cpu-secs):            ',CPUTime()-t
+    CALL Info( Caller, Message, Level = 6 )
+!-------------------------------------------------------------------    
+
+!
+!   Update Solver structure to use the new mesh:
+!   ---------------------------------------------    
+    CALL MeshStabParams( NewMesh )
+!
+!   Nothing computed on this mesh yet:
+!   ----------------------------------
+    NewMesh % SavesDone    = 0  ! start new output file
+    NewMesh % OutputActive = .FALSE.
+    NewMesh % Changed   = .TRUE.
+
+!
+!   Create matrix structures for the new mesh:
+!   ------------------------------------------    
+    t = CPUTime()
+
+!
+!   Try to account for the reordering of DOFs
+!   due to bandwidth optimization:
+    !   -----------------------------------------
+    
+    CALL Info(Caller,'Updating solver mesh to reflect the new adaptive mesh!',Level=12)
+
+    IF (.NOT. WithRecovery) THEN
+      CALL UpdateSolverMesh( Solver, NewMesh, .TRUE. )
+    END IF
+    
+    CALL SetActiveElementsTable( Model, Solver )
+          
+    CALL ParallelInitMatrix( Solver, Solver % Matrix )
+
+    IF (WithRecovery) THEN
+      CALL Info(Caller, 'UpdateSolverMesh for RTFlux solver', Level=12)
+      CALL UpdateSolverMesh(RTFlux % Solver, NewMesh, .TRUE.)
+      CALL Info(Caller, 'UpdateSolverMesh ready', Level=12)
+      CALL SetActiveElementsTable( Model, RTFlux % Solver )
+    END IF
+      
+    WRITE( Message, * ) 'Matrix structures update time (cpu-secs):        ',CPUTime()-t
+    CALL Info( Caller, Message, Level=6 )
+
+!
+!   Release previous meshes. Keep only the original mesh, and
+!   the last two meshes:
+!   ---------------------------------------------------------
+    n = 0
+    Mesh => RefMesh % Parent
+    DO WHILE( ASSOCIATED(Mesh) )
+      sMesh => Mesh % Parent
+      n = n+1
+      IF ( Mesh % AdaptiveDepth /= 0 ) THEN
+        IF ( ASSOCIATED( Mesh % Parent ) ) THEN
+          Mesh % Parent % Child => Mesh % Child                        
+        END IF
+
+        IF ( ASSOCIATED(Mesh % Child) ) THEN
+          Mesh % Child % Parent => Mesh % Parent
+          ! Eliminate the mesh to be released also from here!
+          Mesh % Child % Next => Mesh % Next 
+        END IF
+
+        CALL Info(Caller,'Releasing mesh: '//TRIM(Mesh % Name),Level=8)
+        CALL ReleaseMesh( Mesh )
+
+        !Some solvers should be able to go from Mesh to its child!
+        !Therefore do not nullify the pointers that enable to do that!
+        !Mesh % Child  => NULL()
+        !Mesh % Parent => NULL()
+      END IF
+
+      Mesh => sMesh
+    END DO
+
+!------------------------------------------------------------------------------
+
+10  CONTINUE
+
+    IF (.NOT. WithRecovery) THEN
+      !   Comment the next calls, if you want to keep the edge tables:
+      !   ------------------------------------------------------------
+      IF(.NOT.isPelement(RefMesh % Elements(1))) THEN
+        CALL ReleaseMeshEdgeTables( RefMesh )
+        CALL ReleaseMeshFaceTables( RefMesh )
+      END IF
+    END IF
+    
+    IF (.NOT. ASSOCIATED(Model % Mesh, RefMesh)) CALL SetCurrentMesh( Model, RefMesh )
+    DEALLOCATE( ErrorIndicator, PrevHvalue )
+    
+    IF ( RemeshTime > 0 ) THEN
+      WRITE( Message, * ) 'Mesh refine took in total (cpu-secs):  ', CPUTIme() - TotalTime 
+      CALL Info( Caller, Message, Level=6 )
+      WRITE( Message, * ) 'Remeshing took in total (real-secs):   ',RemeshTime
+      CALL Info( Caller, Message, Level=6 )
+    END IF
+    CALL Info( Caller,'----------- E N D   M E S H   R E F I N E M E N T --------------', Level=5 )
+    
+
+CONTAINS
+
+  SUBROUTINE ShowVectorHistogram(x,n)
+    REAL(KIND=dp) :: x(:)
+    INTEGER :: n
+
+    REAL(KIND=dp) :: xmin,xmax,dx
+    INTEGER :: ncoh
+    INTEGER, ALLOCATABLE :: cohcnt(:)
+
+    ! Just for now do it only for 1st partition
+    ! Later make things parallel.
+    IF( ParEnv % MyPe /= 0) RETURN
+        
+    ncoh = 20
+    ALLOCATE(cohcnt(ncoh))
+    cohcnt = 0
+
+    ! Find extremum errors
+    xmin = MINVAL(x(1:n))
+    xmax = MAXVAL(x(1:n))
+    dx = ( xmax-xmin) / ncoh
+
+    ! Count each error cohort
+    DO i=1,n
+      j = CEILING( (x(i)-xmin)/dx )
+      j = MAX( 1, MIN( j, ncoh ) )
+      cohcnt(j) = cohcnt(j) + 1
+    END DO
+
+    PRINT *,'Histogram for vector:'
+    DO i=1,ncoh
+      IF( cohcnt(i) > 0 ) THEN
+        PRINT *,i,': ',cohcnt(i),' (',xmin+(i-1)*dx,' to ',xmin+i*dx,')'
+      END IF
+    END DO
+       
+  END SUBROUTINE ShowVectorHistogram
+
+
+  ! What fraction of value in x are above xlim? 
+  FUNCTION OutlierFraction(x,n,xlim) RESULT (f)
+    REAL(KIND=dp) :: x(:)
+    REAL(KIND=dp) :: xlim, f
+    INTEGER :: n
+    INTEGER :: np, nlim
+
+    np = n
+    nlim = COUNT(x(1:n) > xlim)
+
+    IF( Parallel ) THEN
+      np = ParallelReduction(np)
+      nlim = ParallelReduction(nlim)
+    END IF
+
+    f = 1.0_dp*nlim/n
+
+  END FUNCTION OutlierFraction
+
+  
+  SUBROUTINE ComputeDesiredHvalue( RefMesh, ErrorLimit, HValue, NodalError, &
+      hConvergence, minH, maxH, MaxChange, Coarsening ) 
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: NodalError(:), hConvergence(:), &
+        ErrorLimit, minH, maxH, MaxChange, HValue(:)
+    LOGICAL :: Coarsening
+    TYPE(Mesh_t), POINTER :: RefMesh
+!------------------------------------------------------------------------------
+    INTEGER :: i,j,k,n
+    REAL(KIND=dp) :: Lambda, hLimitScale
+    INTEGER, ALLOCATABLE :: Hcount(:)
+    TYPE(Matrix_t), POINTER :: A
+!------------------------------------------------------------------------------
+
+    hLimitScale = ListGetConstReal( Params,'Adaptive H Limit Scale', Found )
+    IF ( .NOT.Found ) hLimitScale = 1.0d0
+
+    
+    DO i=1,RefMesh % NumberOfNodes      
+      IF ( NodalError(i) < 100*AEPS ) CYCLE 
+
+      Lambda = ( ErrorLimit / NodalError(i) ) ** ( 1.0d0 / hConvergence(i) )
+
+      IF ( RefMesh % AdaptiveDepth < 1 ) THEN
+        Lambda = HValue(i) * MAX( MIN( Lambda, 1.33d0), 0.75d0)
+      ELSE
+        Lambda = HValue(i) * MAX(MIN(Lambda, MaxChange), 1.0d0/MaxChange)
+      END IF
+
+      IF( .NOT.Coarsening ) Lambda = MIN( Lambda, Hvalue(i) )
+
+      IF ( maxH > 0 ) Lambda = MIN( Lambda, maxH )
+      IF ( minH > 0 ) Lambda = MAX( Lambda, minH )
+
+      HValue(i) = Lambda * hLimitScale
+    END DO
+
+    IF(.NOT. ListCheckPresent(CurrentModel % Solver % Values,'Adaptive Element Count') ) RETURN
+
+    
+    BLOCK
+      TYPE(Element_t), POINTER :: Element
+      TYPE(Nodes_t) :: Nodes
+      REAL(KIND=dp), ALLOCATABLE, SAVE :: Basis(:)
+      REAL(KIND=dp) :: h, Weight, detJ, CountInteg, CountInteg0=-1.0, &
+          CountDesired, Cfix, HScale, Vol
+      TYPE(GaussIntegrationPoints_t) :: IP
+      INTEGER :: dim,i,t
+      LOGICAL :: stat
+      INTEGER :: TimesVisited = 0
+
+      SAVE CountInteg0, Cfix, Nodes, TimesVisited
+      
+      n = RefMesh % MaxElementNodes      
+      IF ( .NOT. ASSOCIATED( Nodes % x ) ) THEN
+        ALLOCATE( Nodes % x(n), Nodes % y(n),Nodes % z(n), Basis(n) )
+      END IF
+      
+      dim = RefMesh % MeshDim
+      TimesVisited = TimesVisited + 1
+
+      IF(TimesVisited == 1) THEN
+        ! These fits are experimental ones in simple geometry using MMG2D and MMG3D
+        ! rounded to the closest integer. 
+        IF( dim == 2 ) THEN
+          Cfix = 2.0_dp
+        ELSE
+          Cfix = 12.0_dp
+        END IF
+      ELSE
+        Cfix = Cfix * RefMesh % NumberOfBulkElements / CountInteg0
+      END IF
+              
+      CountInteg = 0.0_dp
+      Vol = 0.0_dp
+      
+      DO i=1,RefMesh % NumberOfBulkElements
+        Element => RefMesh % Elements(i)
+        
+        n = Element % TYPE % NumberOfNodes
+        Nodes % x(1:n) = RefMesh % Nodes % x(Element % NodeIndexes(1:n))
+        Nodes % y(1:n) = RefMesh % Nodes % y(Element % NodeIndexes(1:n))
+        Nodes % z(1:n) = RefMesh % Nodes % z(Element % NodeIndexes(1:n))
+        
+        IP = GaussPoints( Element )
+        DO t=1,IP % n
+          stat = ElementInfo( Element, Nodes, IP % U(t), IP % V(t), &
+              IP % W(t), detJ, Basis )          
+          Weight = IP % s(t) * DetJ
+          
+          h = SUM(Basis(1:n)*HValue(Element % NodeIndexes(1:n)))          
+
+          CountInteg = CountInteg + Weight * h**(-dim)
+          Vol = Vol + Weight
+        END DO
+      END DO
+
+      CountInteg = Cfix * CountInteg
+      
+      CountDesired = ListGetFun(CurrentModel % Solver % Values,'Adaptive Element Count',&
+          1.0_dp*TimesVisited,Found)      
+      IF( Found .AND. CountDesired > 0.0_dp ) THEN
+        Hscale = (CountInteg/CountDesired)**(1.0_dp/dim)
+        HValue = Hscale * Hvalue
+        CountInteg0 = CountDesired
+      ELSE
+        Hscale = 1.0_dp
+        CountInteg0 = CountInteg
+      END IF
+      
+      IF( InfoActive(10)) THEN
+        PRINT *,'AdaptiveCount: ',CountInteg0, CountInteg, RefMesh % NumberOfBulkElements, &
+            Cfix, Hscale, Vol
+      END IF
+        
+    END BLOCK
+
+
+    
+  END SUBROUTINE ComputeDesiredHvalue
+
+
+! Compute the desired Hvalue at the interface where the adaptive error computation currently
+! fails. This way parallel adaptivity can be done in some way at least...
+!-------------------------------------------------------------------------------------------
+  SUBROUTINE ParallelAverageHvalue( RefMesh, HValue ) 
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: HValue(:)
+    TYPE(Mesh_t), POINTER :: RefMesh
+
+    INTEGER :: i,j,k,l,n,minnei,maxnei
+    INTEGER, POINTER :: p(:)
+    INTEGER, ALLOCATABLE :: Hcount(:), ip(:)
+    TYPE(Matrix_t), POINTER :: A
+!------------------------------------------------------------------------------
+  
+    IF( ParEnv % PEs == 1 ) RETURN
+
+    ALLOCATE(Hcount(SIZE(Hvalue)))
+    Hcount = 0
+    
+    A => Solver % Matrix
+    p => Solver % Variable % Perm
+
+    ALLOCATE(ip(A% NumberOfRows)); ip=0
+
+    DO i=1,RefMesh % NumberOfNodes
+      j = p(i)
+      IF(j<=0) CYCLE
+      ip(j) = i
+    END DO
+
+    DO i=1,RefMesh % NumberOfNodes
+      ! Deal only with interface nodes here
+      j = p(i)
+      IF(j<=0) CYCLE
+      IF(A % ParallelInfo % GInterface(j)) THEN
+        Hvalue(i) = 0.0_dp
+        ! Go through all connected nodes
+        DO l=A % Rows(j),A % Rows(j+1)-1
+          k = A % Cols(l)
+          
+          ! Skip oneself and other interface nodes
+          IF(A % ParallelInfo % GInterface(k)) CYCLE
+
+          k = ip(k)
+          IF(k<=0 .OR. i==k) CYCLE          
+          
+          ! Add the observation
+          Hvalue(i) = Hvalue(i) + Hvalue(k)
+          Hcount(i) = Hcount(i) + 1
+        END DO
+      END IF
+    END DO
+    
+    ! Perform parallel summation, only interface gets summed. 
+    BLOCK
+      INTEGER, ALLOCATABLE :: Xcount(:)
+      REAL(KIND=dp), ALLOCATABLE :: Xvalue(:)
+      ALLOCATE( Xcount(A % NumberOfRows), XValue(A % NumberOfRows) )
+      Xcount = 0; Xvalue = 0
+
+      DO i=1,RefMesh % NumberOfNodes
+        j = p(i)
+        IF (j<=0) CYCLE
+        Xvalue(j) = HValue(i)
+        Xcount(j) = HCount(i)
+      END DO
+
+      CALL ParallelSumVector( A, Xvalue )
+      CALL ParallelSumVectorInt( A, Xcount ) 
+
+      DO i=1,RefMesh % NumberOfNodes
+        j = p(i)
+        IF (j<=0) CYCLE
+        Hvalue(i) = Xvalue(j)
+        Hcount(i) = Xcount(j)
+      END DO
+    END BLOCK
+
+
+    maxnei = MAXVAL( Hcount )
+    minnei = MINVAL( Hcount, Hcount > 0 ) 
+
+    maxnei = ParallelReduction(maxnei,2)
+    minnei = ParallelReduction(minnei,1)     
+
+    CALL Info('ParallelAverageHvalue','Averaging count range is ['//TRIM(I2S(minnei)) &
+        //','//TRIM(I2S(maxnei))//']',Level=7)
+    
+    
+    ! Compute the average
+    n = 0
+    DO i=1,RefMesh % NumberOfNodes
+      j = p(i)
+      IF (j<=0) CYCLE
+      IF(A % ParallelInfo % GInterface(j)) THEN
+        IF( Hcount(i) == 0 ) THEN
+          n = n+1
+        ELSE          
+          Hvalue(i) = Hvalue(i) / Hcount(i) 
+        END IF
+      END IF
+    END DO
+    
+    n = ParallelReduction(n)
+    CALL Info('ParallelAverageHvalue','Nodes '//TRIM(I2S(n))//' surrounded by orphans only!')
+
+    ! Check dofs that have not been defined by averaging
+    IF( n > 0 ) THEN
+      Hcount = -Hcount
+
+      DO i=1,RefMesh % NumberOfNodes
+        j = p(i)
+        IF(j<=0) CYCLE
+        IF(A % ParallelInfo % GInterface(j)) THEN
+          IF(Hcount(i) == 0) THEN
+            DO l=A % Rows(j),A % Rows(j+1)-1
+              k = ip( A % Cols(l) )
+              IF( k<=0 ) CYCLE
+
+              IF(i==k) CYCLE
+              ! Use only nodes that were defined by averaging for the interface.
+              IF(Hcount(k) < 0) THEN
+                Hvalue(i) = Hvalue(i) + Hvalue(k)
+                Hcount(i) = Hcount(i) + 1
+              END IF
+            END DO
+          END IF
+        END IF
+      END DO
+
+      ! This is a trick to get the already computed nodes to be properly re-everaged
+      WHERE(Hcount<0) Hcount = 1 
+      
+      ! Perform parallel summation, only interface gets summed. 
+      BLOCK
+        INTEGER, ALLOCATABLE :: Xcount(:)
+        REAL(KIND=dp), ALLOCATABLE :: Xvalue(:)
+        ALLOCATE( Xcount(A % NumberOfRows), XValue(A % NumberOfRows) )
+        Xcount = 0; Xvalue = 0
+
+        DO i=1,RefMesh % NumberOfNodes
+          j = p(i)
+          IF (j<=0) CYCLE
+          Xvalue(j) = HValue(i)
+          Xcount(j) = HCount(i)
+        END DO
+
+        CALL ParallelSumVector( A, Xvalue )
+        CALL ParallelSumVectorInt( A, Xcount ) 
+
+        DO i=1,RefMesh % NumberOfNodes
+          j = p(i)
+          IF (j<=0) CYCLE
+          Hvalue(i) = Xvalue(j)
+          Hcount(i) = Xcount(j)
+        END DO
+      END BLOCK
+
+!     CALL ParallelSumVector( A, Hvalue )
+!     CALL ParallelSumVectorInt( A, Hcount ) 
+      
+      n = 0
+      DO i=1,RefMesh % NumberOfNodes
+        j = p(i)
+        IF (j<=0) CYCLE 
+        IF(A % ParallelInfo % GInterface(j)) THEN
+          IF( Hcount(i) == 0 ) THEN
+            n = n+1
+          ELSE 
+            Hvalue(i) = Hvalue(i) / Hcount(i) 
+          END IF
+        END IF
+      END DO
+      
+      CALL Info('ParallelAverageHvalue','Nodes '//TRIM(I2S(n))//' surrounded by orphans only again!')        
+    END IF
+    
+!    IF( InfoActive(20) ) THEN
+!      CALL VectorValuesRange(Hvalue,SIZE(Hvalue),'Hvalue')             
+!    END IF
+    
+  END SUBROUTINE ParallelAverageHvalue
+
+
+  
+#ifdef HAVE_MMG
+
+!------------------------------------------------------------------------------
+  FUNCTION MMG_ReMesh( RefMesh, ErrorLimit, HValue, NodalError, &
+       hConvergence, minH, maxH, MaxChange, Coarsening ) RESULT( NewMesh )
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: NodalError(:), hConvergence(:), &
+           ErrorLimit, minH, maxH, MaxChange, HValue(:)
+    LOGICAL :: Coarsening
+    TYPE(Mesh_t), POINTER :: NewMesh, RefMesh
+!------------------------------------------------------------------------------
+    TYPE(Mesh_t), POINTER :: Mesh, TmpMesh, GatheredMesh
+    INTEGER :: i,j,k,n,ierr
+    REAL(KIND=dp) :: Lambda
+    CHARACTER(LEN=MAX_NAME_LEN) :: MeshCommand, Name
+    CHARACTER(LEN=MAX_PATH_LEN) :: MeshInputFile
+    LOGICAL :: Success, Rebalance, EnforceSerial
+    REAL(KIND=dp) :: xmax, xmin, ymax, ymin, zmax, zmin, cscale
+    LOGICAL :: ScaleCoord
+    INTEGER :: DoerPart
+    REAL(KIND=dp), POINTER :: NodalVals(:,:)
+    CHARACTER(*), PARAMETER :: Caller = 'MMG_ReMesh'
+        
+!------------------------------------------------------------------------------
+
+#if 0
+    ! This is just some debugging code to check that the averaging works as intended.
+    TYPE(Variable_t), POINTER :: Var
+    REAL(KIND=dp), POINTER :: AveTest(:)
+    TYPE(Matrix_t), POINTER :: A
+
+    n = RefMesh % NumberOfNodes 
+    ALLOCATE(AveTest(n))
+    AveTest(1:n) = RefMesh % Nodes % x(1:n) + & 
+        RefMesh % Nodes % y(1:n) + RefMesh % Nodes % z(1:n) 
+
+    A => CurrentModel % Solver % Matrix       
+    WHERE( A % ParallelInfo % GInterface(1:n) ) 
+      AveTest(1:n) = -1000.0
+    END WHERE
+      
+    CALL VariableAdd( RefMesh % Variables, RefMesh, Solver, &
+        'Ave Test', 1, AveTest, Output = .TRUE.) 
+    CALL ParallelAverageHvalue( RefMesh, AveTest )
+
+    AveTest(1:n) = AveTest(1:n) - ( RefMesh % Nodes % x(1:n) + & 
+        RefMesh % Nodes % y(1:n) + RefMesh % Nodes % z(1:n) )
+   
+    IF( InfoActive(20) ) THEN
+      CALL VectorValuesRange(Hvalue,SIZE(Hvalue),'Ave Test')             
+    END IF
+#endif
+
+    CALL ComputeDesiredHvalue( RefMesh, ErrorLimit, Hvalue, NodalError, &
+        hConvergence, minH, maxH, MaxChange, Coarsening ) 
+    CALL ParallelAverageHvalue( RefMesh, Hvalue ) 
+    
+    Var => VariableGet( RefMesh % Variables, 'Hvalue', ThisOnly=.TRUE. )      
+
+    IF( RefMesh % MeshDim == 2 ) THEN
+      IF( ParEnv % PEs > 1 ) THEN
+        CALL Fatal(Caller,'2D remeshing not available in parallel!')
+      ELSE
+        CALL Info(Caller,'Calling serial remeshing routines in 2D',Level=10)
+        NewMesh => MMG2D_ReMesh( RefMesh, Var )
+      END IF
+    ELSE
+      EnforceSerial = ListGetLogical( Params,'Adaptive Remesh Serial',Found )  
+      IF( ParEnv % PEs > 1 .AND. .NOT. EnforceSerial ) THEN
+        CALL Info(Caller,'Calling parallel remeshing routines in 3D',Level=10)
+
+        ScaleCoord = ListGetLogical(Params, 'Adaptive Scale Coordinates for MMG', Found)
+
+        IF(ScaleCoord) THEN
+          xmin = ParallelReduction( MINVAL(refmesh % nodes % x), 1)
+          xmax = ParallelReduction( MAXVAL(refmesh % nodes % x), 2)
+
+          ymin = ParallelReduction( MINVAL(refmesh % nodes % y), 1)
+          ymax = ParallelReduction( MAXVAL(refmesh % nodes % y), 2)
+
+          zmin = ParallelReduction( MINVAL(refmesh % nodes % z), 1)
+          zmax = ParallelReduction( MAXVAL(refmesh % nodes % z), 2)
+
+          cscale = 1 * MAX( xmax - xmin, MAX( ymax - ymin, zmax - zmin)  )
+
+          refmesh % nodes % x = cscale * refmesh % nodes % x
+          refmesh % nodes % y = cscale * refmesh % nodes % y
+          refmesh % nodes % z = cscale * refmesh % nodes % z
+          var % values = cscale * var % values
+        END IF
+
+        CALL DistributedRemeshParMMG(Model, RefMesh, TmpMesh,&
+            Params = Solver % Values, HVar = Var )
+
+        IF( ScaleCoord ) THEN
+          cscale = 1._dp / cscale
+
+          tmpmesh % nodes % x = cscale * tmpmesh % nodes % x
+          tmpmesh % nodes % y = cscale * tmpmesh % nodes % y
+          tmpmesh % nodes % z = cscale * tmpmesh % nodes % z
+
+          refmesh % nodes % x = cscale * refmesh % nodes % x
+          refmesh % nodes % y = cscale * refmesh % nodes % y
+          refmesh % nodes % z = cscale * refmesh % nodes % z
+          var % values = cscale * var % values
+        END IF
+
+        CALL RenumberGElems(TmpMesh)
+
+        Rebalance = ListGetLogical(Model % Solver % Values, "Adaptive Rebalance", Found, DefValue = .TRUE.)
+        IF(Rebalance) THEN
+          CALL Zoltan_Interface( Model, TmpMesh, StartImbalanceTol=1.1_dp, TolChange=0.02_dp, MinElems=10 )          
+          NewMesh => RedistributeMesh(Model, TmpMesh, .TRUE., .FALSE.)
+          CALL ReleaseMesh(TmpMesh)
+        ELSE
+          NewMesh => TmpMesh          
+        END IF
+      ELSE IF( ParEnv % PEs > 1 .AND. EnforceSerial ) THEN
+        CALL Info(Caller,'Calling serial remeshing routines for parallel 3D run',Level=10)
+
+        n = RefMesh % NumberOfBulkElements + RefMesh % NumberOfBoundaryElements
+        IF(.NOT. ASSOCIATED(RefMesh % Repartition)) THEN
+          ALLOCATE(RefMesh % Repartition(n), STAT=ierr)
+          IF(ierr /= 0) CALL Fatal(Caller,'Could not ALLOCATE RefMesh % Repartition')
+        END IF               
+        ! For now, set to target with all to 1st partition
+        DoerPart = ListGetInteger( Params,'Adaptive Remesh Owner',Found ) 
+
+        RefMesh % Repartition = DoerPart + 1
+
+        PRINT *,'RefMesh: ',ParEnv % MyPe, &
+            RefMesh % NumberOfBulkElements, RefMesh % NumberOfBoundaryElements
+
+        IF( ASSOCIATED( Var % Perm ) ) THEN
+          DO i=1,SIZE(Var % Perm)
+            IF(i /= Var % Perm(i)) THEN
+              CALL Fatal(Caller,'H field should have unity perm at this stage!')
+            END IF
+          END DO
+        END IF
+          
+        ALLOCATE(NodalVals(Refmesh % NumberOfNodes,1))
+        NodalVals(:,1) = Var % Values
+        GatheredMesh => RedistributeMesh(Model, RefMesh, .TRUE., .FALSE., NodalVals)
+!        GatheredMesh => RedistributeMesh(Model, RefMesh, .TRUE., .FALSE.)
+        
+        PRINT *,'GatheredMesh: ',ParEnv % MyPe, &
+            gatheredMesh % NumberOfBulkElements, gatheredMesh % NumberOfBoundaryElements
+
+        IF( ParEnv % MyPe == DoerPart ) THEN
+#if 0 
+          ! Save the gathered serial mesh for debugging purposes
+          CALL WriteMeshToDisk2(Model, GatheredMesh,'gathered')
+#endif
+
+          DEALLOCATE(Var % Values)
+          ALLOCATE(Var % Values(GatheredMesh % NumberOfNodes))
+          Var % Values = NodalVals(:,1)
+          IF(ASSOCIATED(Var % Perm)) DEALLOCATE(Var % Perm)
+          ALLOCATE(Var % Perm(GatheredMesh % NumberOfNodes))
+          DO i=1,GatheredMesh % NumberOfNodes
+            Var % Perm(i) = i
+          END DO
+
+          ! Here do the adaptive remeshing with serial MMG3D since the parallel one is not very robust. 
+          CALL RemeshMMG3D(Model, GatheredMesh, TmpMesh,Params = Solver % Values, &
+              HVar = Var, Success = Success )
+
+          ! Thereafter partition the mesh in a serial manner. 
+          IF( ListGetString( Solver % Values,'Partitioning method',Found) == 'zoltan') THEN
+            CALL Zoltan_Interface( Model, TmpMesh, SerialMode = .TRUE., NoPartitions = ParEnv % PEs, &
+                StartImbalanceTol=1.1_dp, TolChange=0.02_dp, MinElems=10 )
+          ELSE
+            CALL PartitionMeshSerial( Model, TmpMesh, Solver % Values )
+          END IF
+
+#if 0 
+          ! Save the remeshed serial mesh for debugging purposes
+          CALL WriteMeshToDisk2(Model, TmpMesh,'remeshed')
+#endif
+        ELSE
+          TmpMesh => AllocateMesh()
+          TmpMesh % MeshDim = RefMesh % MeshDim
+        END IF
+        !CALL RenumberGElems(TmpMesh)
+
+        NewMesh => RedistributeMesh(Model, TmpMesh, .TRUE., .FALSE.)
+        CALL ReleaseMesh(TmpMesh)
+      ELSE              
+        CALL Info(Caller,'Calling serial remeshing routines in 3D',Level=10)
+        CALL RemeshMMG3D(Model, RefMesh, NewMesh,Params = Solver % Values, &
+            HVar = Var, Success = Success )
+      END IF
+      CALL Info(Caller,'Finished MMG remeshing',Level=20)      
+    END IF
+
+!------------------------------------------------------------------------------
+  END FUNCTION MMG_Remesh
+!------------------------------------------------------------------------------
+#endif
+
+  
+!------------------------------------------------------------------------------
+  FUNCTION External_ReMesh( RefMesh, ErrorLimit, HValue, NodalError, &
+       hConvergence, minH, maxH, MaxChange, Coarsening ) RESULT( NewMesh )
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: NodalError(:), hConvergence(:), &
+           ErrorLimit, minH, maxH, MaxChange, HValue(:)
+    LOGICAL :: Coarsening
+    TYPE(Mesh_t), POINTER :: NewMesh, RefMesh
+!------------------------------------------------------------------------------
+    TYPE(Mesh_t), POINTER :: Mesh
+    INTEGER :: i,j,k,n,dim
+    REAL(KIND=dp) :: Lambda
+    REAL(KIND=dp), POINTER :: HValueF(:)
+    CHARACTER(:), ALLOCATABLE :: MeshCommand, Name, MeshInputFile
+    LOGICAL :: GmshFormat
+    LOGICAL :: GmshPosFormat
+!------------------------------------------------------------------------------
+
+    dim = CoordinateSystemDimension()
+
+    ! Create a temporal field that includes the desired mesh density where Hvalue has been computed. 
+    ! This is in terms of desired mesh density, currently -1 value is given if the nodal error is zero
+    ! implying that nothing is computed here. 
+    ALLOCATE(HvalueF(SIZE(HValue)))
+    HValueF = -1.0_dp
+    DO i=1,RefMesh % NumberOfNodes
+      IF ( NodalError(i) > 100*AEPS ) THEN
+        Lambda = ( ErrorLimit / NodalError(i) ) ** ( 1.0d0 / hConvergence(i) )        
+        IF ( RefMesh % AdaptiveDepth < 1 ) THEN
+          Lambda = HValue(i) * MAX( MIN( Lambda, 1.33d0), 0.75d0)
+        ELSE
+          Lambda = HValue(i) * MAX(MIN(Lambda, MaxChange), 1.0d0/MaxChange)
+        END IF        
+        IF( .NOT.Coarsening ) Lambda = MIN( Lambda, Hvalue(i) )        
+
+        IF ( maxH > 0 ) Lambda = MIN( Lambda, maxH )
+        IF ( minH > 0 ) Lambda = MAX( Lambda, minH )        
+        HValueF(i) = Lambda
+      END IF
+    END DO
+
+    ! Save the current mesh in Elmer mesh format 
+    Path = ListGetString( Params, 'Adaptive Mesh Name', Found )
+    nlen = LEN_TRIM(Path)
+   
+    IF ( .NOT. Found ) THEN
+      i = RefMesh % AdaptiveDepth + 1
+      Path = 'RefinedMesh'//I2S(i)
+    END IF
+
+    nlen = LEN_TRIM(OutputPath)
+    IF ( nlen > 0 ) THEN
+      Path = OutputPath(1:nlen) // '/' // TRIM(Path)
+    ELSE
+      Path = TRIM(Path)
+    END IF
+    
+    GmshFormat = ListGetLogical( Params,'Adaptive Remesh Use Gmsh', Found )
+
+    IF( GmshFormat ) THEN
+
+      GmshPosFormat = ListGetLogical( Params,'Adaptive Remesh Gmsh Use Pos Format', Found )
+      ! write the background mesh in .pos format if user requested it.
+      IF( GmshPosFormat) THEN
+      
+        ! Get the coordinate scaling. This is used to scale the background mesh coordinates according to the original mesh.
+        MeshDim = RefMesh % MaxDim
+
+        Wrk => ListGetConstRealArray( Model % Simulation,'Coordinate Scaling',Found )
+        CoordScale = 1.0_dp    
+        IF( Found ) THEN            
+        DO i=1, MeshDim
+          j = MIN( i, SIZE(Wrk,1) )
+          CoordScale(i) = Wrk(j,1)
+        END DO
+        WRITE(Message,'(A,3ES10.3)') 'Scaling the background mesh coordinates:',CoordScale(1:3)
+        CALL Info(Caller ,Message, Level=10)
+        END IF 
+        
+        ! write the background mesh in .pos format
+        CALL Info( Caller,'Saving background mesh density in gmsh .pos format' )
+        OPEN( 11, STATUS='UNKNOWN',FILE='gmsh_bgmesh.pos' )
+        WRITE( 11,* ) 'View "mesh size field" {'           
+        DO i=1,RefMesh % NumberOfNodes
+          IF(.NOT. (HValueF(i) > 0.0_dp )) CYCLE
+          IF (dim == 2 ) THEN
+            WRITE( 11,* ) 'SP(', (RefMesh % Nodes % x(i)) / CoordScale(1), &
+                        ', ', (RefMesh % Nodes % y(i)) / CoordScale(2), ') {', &
+                        HValueF(i) / MIN(CoordScale(1), CoordScale(2)), '};'
+          ELSE
+            WRITE( 11,* ) 'SP(', (RefMesh % Nodes % x(i)) / CoordScale(1), &
+                        ', ', (RefMesh % Nodes % y(i)) / CoordScale(2), &
+                        ', ', (RefMesh % Nodes % z(i)) / CoordScale(3), ') {', &
+                        HValueF(i) / MIN(CoordScale(1), MIN(CoordScale(2), CoordScale(3))), '};'
+          END IF
+        END DO
+        WRITE( 11,* ) '};'
+        CLOSE(11)
+      ELSE
+
+        CALL Info( Caller,'Saving background mesh density in gmsh 2.0 (.msh) format' )
+
+        ! A cludge to change the pointer and save results in Gmsh format.
+        BLOCK
+          REAL(KIND=dp), POINTER :: PtoHvalue(:)
+          TYPE(Variable_t), POINTER :: HVar
+          HVar => VariableGet( RefMesh % Variables,'Hvalue')
+          pToHvalue => HVar % Values
+          HVar % Values => HvalueF        
+          CALL ListAddString(Solver % Values,'Scalar Field 1','Hvalue')
+          CALL ListAddLogical(Solver % Values,'File Append',.FALSE.)
+          CALL ListAddLogical(Solver % Values,'Alter Topology',.TRUE.) 
+          CALL ListAddNewString(Solver % Values, 'Output File Name', 'gmsh_bgmesh.msh')        
+          CALL SaveGmshOutput( Model,Solver,0.0_dp,.FALSE.)
+          HVar % Values => PtoHvalue
+        END BLOCK
+      END IF
+    ELSE      
+      CALL Info( Caller,'Saving background mesh density in point cloud format' )
+
+      OPEN( 11, STATUS='UNKNOWN', FILE='bgmesh.nodes' )
+      WRITE( 11,* ) COUNT( HValueF > 0.0_dp )           
+      DO i=1,RefMesh % NumberOfNodes
+        IF(.NOT. (HValueF(i) > 0.0_dp )) CYCLE
+        IF (dim == 2 ) THEN
+          WRITE(11,'(3e23.15)') RefMesh % Nodes % x(i), &
+              RefMesh % Nodes % y(i), HValueF(i)
+        ELSE
+          WRITE(11,'(4e23.15)') RefMesh % Nodes % x(i), &
+              RefMesh % Nodes % y(i), &
+              RefMesh % Nodes % z(i), HValueF(i)
+        END IF
+      END DO
+      WRITE(11,*) 0
+      CLOSE(11)
+
+      CALL MakeDirectory( TRIM(Path) // CHAR(0) )
+      CALL WriteMeshToDisk( RefMesh, Path )
+    END IF
+
+    Mesh => RefMesh
+    DO WHILE( ASSOCIATED( Mesh ) )
+      IF ( Mesh % AdaptiveDepth == 0 ) EXIT
+      Mesh => Mesh % Parent
+    END DO
+
+    MeshCommand = ListGetString( Solver % Values,'Mesh Command',Found) 
+    IF(.NOT. Found ) THEN
+      IF( GmshFormat ) THEN
+        CALL Fatal('ReMesh','For now, provide "Mesh Command" for Gmsh meshing!')
+      END IF
+
+      MeshInputFile = ListGetString( Params, 'Mesh Input File', Found )
+      IF ( .NOT. Found ) THEN
+        MeshInputFile = ListGetString( Model % Simulation, 'Mesh Input File' )
+      END IF
+
+      MeshCommand = TRIM(OutputPath) // '/' // TRIM(Mesh % Name) // '/' // &
+          TRIM( MeshInputFile )
+
+      SELECT CASE( dim )
+      CASE(2)
+        ! Legacy mesh generator from the Elmer suite.
+        MeshCommand = 'Mesh2D '//TRIM(MeshCommand)//' '//TRIM(Path)// ' --bgmesh=bgmesh.nodes'
+      CASE(3)
+        MeshCommand = 'Mesh3D '//TRIM(MeshCommand)//' '//TRIM(Path)//' bgmesh.nodes'
+      END SELECT
+    END IF
+
+    ! Remeshing command. 
+    CALL Info('ReMesh','Meshing command: '//TRIM(MeshCommand),Level=10)
+    CALL SystemCommand( MeshCommand )
+
+    ! Check if also conversion command is given. 
+    MeshCommand = ListGetString( Solver % Values,'Mesh Conversion Command',Found)
+    IF( Found ) THEN
+      ! add the output path to the command. 
+      MeshCommand = MeshCommand // ' -out ' // TRIM(Path)
+      CALL Info('ReMesh','Conversion command: '//TRIM(MeshCommand),Level=10)
+      CALL SystemCommand( MeshCommand )
+    END IF    
+
+    ! Read the new mesh. 
+    NewMesh => LoadMesh2( Model, OutPutPath, Path, .FALSE., 1, 0 )
+
+    ! Loading Gebhart factors is more or less obsolete. 
+    IF ( Solver % Variable % Name == 'temperature' ) THEN
+       Name = ListGetString( Model % Simulation, 'Gebhart Factors', Found )
+       IF ( Found ) THEN
+          MeshCommand = 'View ' // TRIM(OutputPath) // &
+                '/' // TRIM(Mesh % Name) // ' ' // TRIM(Path)
+          CALL SystemCommand( MeshCommand )
+
+          Name = TRIM(OutputPath) // '/' // &
+              TRIM(Mesh % Name) // '/' // TRIM(Name)
+          CALL LoadGebhartFactors( NewMesh, TRIM(Name) )
+       END IF
+    END IF
+
+    DEALLOCATE(HvalueF)
+    
+!------------------------------------------------------------------------------
+  END FUNCTION External_ReMesh
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+  FUNCTION SplitMesh( RefMesh,ErrorIndicator,ErrorLimit, NodalError, &
+       Hvalue, hConvergence, minH, maxH, MaxChange ) RESULT(NewMesh)
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: NodalError(:), hConvergence(:), Hvalue(:), MaxChange
+    TYPE(Mesh_t), POINTER :: NewMesh, RefMesh
+    REAL(KIND=dp) :: ErrorIndicator(:),ErrorLimit,minH,maxH
+!------------------------------------------------------------------------------
+    TYPE(Mesh_t), POINTER :: NewMesh1
+    REAL(KIND=dp) :: Lambda, EhConvergence
+    INTEGER :: i,j,k,n,MarkedElements
+    TYPE(Element_t), POINTER :: RefElement
+!------------------------------------------------------------------------------
+
+    NULLIFY( NewMesh )
+
+!   Determine the marked elements:
+!   ------------------------------
+    MarkedElements = 0
+
+    DO i = 1,RefMesh % NumberOfBulkElements
+       RefElement => RefMesh % Elements(i)
+
+       IF ( RefElement % TYPE % ElementCode /= 303 ) THEN
+          CALL Fatal( 'SplitMesh', 'Internal splitting implemented only for linear triangles.' )
+       END IF
+
+       n = RefElement % TYPE % NumberOfNodes
+
+       IF( RefMesh % AdaptiveDepth < 1 ) THEN
+          EhConvergence = 1.0d0 ! First round: Assume full convergence speed
+       ELSE
+          EhConvergence = SUM( hConvergence( RefElement % Nodeindexes(1:n) ) ) / n
+       END IF
+
+       RefElement % Splitted = 0
+       IF( ErrorIndicator(i) > 100*AEPS ) THEN
+          Lambda = ( ErrorLimit / ErrorIndicator(i) ) ** ( 1.0d0 / EhConvergence )
+          RefElement % Splitted = MIN( MaxChange, 1.0d0/Lambda )
+       END IF
+
+       IF ( RefElement % Splitted > 0 ) MarkedElements = MarkedElements  + 1
+    END DO
+
+    IF ( MarkedElements == 0 ) THEN
+       RefMesh % Changed = .FALSE.
+       RETURN
+    END IF
+
+!   Refine until all elements splitted specified times:
+!   ---------------------------------------------------
+    NewMesh => SplitOneLevel( RefMesh )
+    DO WHILE( .TRUE. )
+       MarkedElements = 0
+       DO i=1,NewMesh % NumberOfBulkElements
+          IF ( NewMesh % Elements(i) % Splitted > 0 ) THEN
+             MarkedElements = MarkedElements + 1
+          END IF
+       END DO
+
+       IF ( MarkedElements == 0 ) EXIT
+
+       NewMesh1 => SplitOneLevel( NewMesh )
+       CALL ReleaseMesh( NewMesh )
+       DEALLOCATE( NewMesh )
+
+       NewMesh => NewMesh1
+    END DO
+
+!------------------------------------------------------------------------------
+  END FUNCTION SplitMesh
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+  FUNCTION SplitOneLevel( RefMesh ) RESULT( NewMesh )
+!------------------------------------------------------------------------------
+    IMPLICIT NONE
+
+    TYPE( Mesh_t ), POINTER :: RefMesh, NewMesh
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: t
+    INTEGER :: EdgeNumber,LongestEdge,Node1,Node2
+    INTEGER :: i,j,k,l,n,NewElCnt,NewNodeCnt,MarkedEdges
+
+    TYPE(Element_t), POINTER :: RefElement,Parent,Child,Edge
+
+    LOGICAL, POINTER :: EdgeSplitted(:)
+    INTEGER, POINTER :: MarkedOrder(:), Children(:,:)
+
+    TYPE(PElementDefs_t), POINTER :: PD
+    REAL(KIND=dp) :: x1, x2, y1, y2, EdgeLength, MaxLength
+!------------------------------------------------------------------------------
+
+    t = CPUTime()
+    CALL FindMeshEdges( RefMesh )
+    WRITE( Message, * ) 'Find mesh edges time (cpu-secs):                 ',CPUTime()-t
+    CALL Info( 'SplitOneLevel', Message, Level=6 )
+
+!   RGB Refinement:
+!   ---------------
+    t = CPUTime()
+    CALL AllocateVector( EdgeSplitted, RefMesh % NumberOfEdges )
+    MarkedEdges = RGBRefinement( EdgeSplitted,RefMesh )
+    WRITE( Message, * ) 'RGB Refinement time (cpu-secs):                  ',CPUTime()-t
+    CALL Info( 'SplitOneLevel', Message, Level=6 )
+
+!   Initialize the new mesh:
+!   ------------------------
+    NewMesh => AllocateMesh()
+    NewMesh % MaxElementNodes = 3
+    NewMesh % MaxElementDOFs  = 3
+    NewMesh % MeshDim = RefMesh % MeshDim
+
+!   Create node tables for the new mesh:
+!   ------------------------------------    
+    t = CPUTime()
+    NewMesh % NumberOfNodes = RefMesh % NumberOfNodes + MarkedEdges
+    CALL AllocateVector( NewMesh % Nodes % x, NewMesh % NumberOfNodes )
+    CALL AllocateVector( NewMesh % Nodes % y, NewMesh % NumberOfNodes )
+    CALL AllocateVector( NewMesh % Nodes % z, NewMesh % NumberOfNodes )
+
+!   Add old nodes to the new mesh:
+!   ------------------------------    
+    NewMesh % Nodes % x(1:RefMesh % NumberOfNodes) = &
+               RefMesh % Nodes % x(1:RefMesh % NumberOfNodes)
+    NewMesh % Nodes % y(1:RefMesh % NumberOfNodes) = &
+               RefMesh % Nodes % y(1:RefMesh % NumberOfNodes)
+    NewMesh % Nodes % z(1:RefMesh % NumberOfNodes) = &
+               RefMesh % Nodes % z(1:RefMesh % NumberOfNodes)
+
+!   Add new nodes to the new mesh:
+!   ------------------------------    
+    NewNodeCnt = RefMesh % NumberOfNodes
+    DO i = 1,RefMesh % NumberOfEdges
+       IF ( EdgeSplitted(i) ) THEN
+          Node1 = RefMesh % Edges(i) % NodeIndexes(1)
+          Node2 = RefMesh % Edges(i) % NodeIndexes(2)
+          x1 = RefMesh % Nodes % x(Node1)
+          x2 = RefMesh % Nodes % x(Node2)
+          y1 = RefMesh % Nodes % y(Node1)
+          y2 = RefMesh % Nodes % y(Node2)
+          NewNodeCnt = NewNodeCnt + 1
+          NewMesh % Nodes % x(NewNodeCnt) = (x1+x2) / 2.0d0
+          NewMesh % Nodes % y(NewNodeCnt) = (y1+y2) / 2.0d0
+          NewMesh % Nodes % z(NewNodeCnt) = 0.0d0
+       END IF
+    END DO
+    WRITE( Message, * ) 'Node tables generation time (cpu-secs):          ',CPUTime()-t
+    CALL Info( 'SplitOneLevel', Message, Level=6 )
+
+!   Count the new number of bulk elements:
+!   --------------------------------------
+    CALL AllocateVector( MarkedOrder, RefMesh % NumberOfEdges )
+    MarkedOrder = 0
+
+    k = 0
+    NewElCnt = 0
+    DO i = 1,RefMesh % NumberOfBulkElements
+       MarkedEdges = 0
+       DO j = 1,3
+          EdgeNumber = RefMesh % Elements(i) % EdgeIndexes(j)
+          IF( EdgeSplitted(EdgeNumber) ) THEN
+             MarkedEdges = MarkedEdges + 1
+             IF ( MarkedOrder(EdgeNumber) == 0 ) THEN
+                k = k + 1
+                MarkedOrder(EdgeNumber) = k + RefMesh % NumberOfNodes
+             END IF
+          END IF
+       END DO
+       NewElCnt = NewElCnt + MarkedEdges + 1
+    END DO
+    NewMesh % NumberOfBulkElements = NewElCnt
+!
+!   Count the new number of boundary elements:
+!   ------------------------------------------
+    NewElCnt = 0
+    DO i = RefMesh % NumberOfBulkElements+1,RefMesh % NumberOfBulkElements+&
+         RefMesh % NumberOfBoundaryElements
+
+       RefElement => RefMesh % Elements(i) % BoundaryInfo % Left
+       IF ( .NOT.ASSOCIATED( RefElement) ) &
+            RefElement => RefMesh % Elements(i) % BoundaryInfo % Right
+
+       IF ( ASSOCIATED( RefElement ) ) THEN
+          NULLIFY( Edge )
+
+          DO j=1,3
+             Edge => RefMesh % Edges(RefElement % EdgeIndexes(j))
+
+             IF ( Edge % NodeIndexes(1) == RefMesh % Elements(i) % NodeIndexes(1) .AND. &
+                  Edge % NodeIndexes(2) == RefMesh % Elements(i) % NodeIndexes(2) .OR.  &
+                  Edge % NodeIndexes(2) == RefMesh % Elements(i) % NodeIndexes(1) .AND. &
+                  Edge % NodeIndexes(1) == RefMesh % Elements(i) % NodeIndexes(2) ) EXIT
+          END DO
+   
+          IF ( EdgeSplitted( RefElement % EdgeIndexes(j) ) ) THEN
+             NewElCnt = NewElCnt + 2
+          ELSE
+             NewElCnt = NewElCnt + 1
+          END IF
+       ELSE
+          NewElCnt = NewElCnt + 1
+       END IF
+    END DO
+
+    NewMesh % NumberOfBoundaryElements = NewElCnt
+
+!   Allocate element tables:
+!   ------------------------
+    t = CPUTime()
+    CALL AllocateVector( NewMesh % Elements, NewMesh % NumberOfBulkElements + &
+         NewMesh % NumberOfBoundaryElements )
+
+    CALL AllocateArray( Children, RefMesh % NumberOfBulkElements + &
+             RefMesh % NumberOfBoundaryElements, 4 )
+    Children = 0
+
+!   Find the new bulk elements:
+!   ---------------------------
+    NewElCnt    = 0
+    DO i = 1,RefMesh % NumberOfBulkElements
+       RefElement => RefMesh % Elements(i)
+       n = RefElement % TYPE % NumberOfNodes
+
+       MarkedEdges = 0
+       DO j = 1,3
+          EdgeNumber = RefElement % EdgeIndexes(j)
+          IF ( EdgeSplitted(EdgeNumber) ) THEN
+             MarkedEdges = MarkedEdges + 1
+          END IF
+       END DO
+
+!      Make elements for the new mesh:
+!      --------------------------------
+       SELECT CASE(MarkedEdges)
+       CASE(0)
+!         Just copy of the old one:
+!         -------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1:n) = &
+               RefElement % NodeIndexes(1:n)
+
+          Children(i,1) = NewElCnt
+          
+!-------------------------------------------------------------------------
+       CASE(1)
+!         Bisect the longest edge to give two triangles:
+!         ----------------------------------------------
+          DO j = 1,3
+             EdgeNumber = RefElement % EdgeIndexes(j)
+             IF ( EdgeSplitted( EdgeNumber ) ) EXIT
+          END DO
+            
+!         Find node (k) opposite to the splitted edge:
+!         --------------------------------------------
+          DO k = 1,3
+             IF ( RefElement % NodeIndexes(k) /= &
+                  RefMesh % Edges(EdgeNumber) % NodeIndexes(1) .AND. &
+                  RefElement % NodeIndexes(k) /= &
+                  RefMesh % Edges(EdgeNumber) % NodeIndexes(2) ) EXIT
+          END DO
+
+!         New element 1
+!         -------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+               RefElement % NodeIndexes(k)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(2) = &
+               RefMesh % Edges(EdgeNumber) % NodeIndexes(1)
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(3) = &
+               MarkedOrder(RefElement % EdgeIndexes(j))
+
+          Children(i,1) = NewElCnt
+
+!         New element 2
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+               RefElement % NodeIndexes(k)
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(2) = &
+               MarkedOrder(RefElement % EdgeIndexes(j))
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(3) = &
+               RefMesh % Edges(EdgeNumber) % NodeIndexes(2)
+
+          Children(i,2) = NewElCnt
+
+!-------------------------------------------------------------------------
+       CASE(2)
+!         Bisect two of the edges to give three new elements:
+!         ---------------------------------------------------
+
+!         Find the edge NOT splitted:
+!         ---------------------------
+          DO j = 1,3
+             EdgeNumber = RefElement % EdgeIndexes(j)
+             IF ( .NOT.EdgeSplitted( EdgeNumber ) ) EXIT             
+          END DO
+
+!         Find node (k) opposite to the edge NOT splitted:
+!         ------------------------------------------------
+          DO k = 1,3
+             IF (RefElement % NodeIndexes(k) /= &
+                  RefMesh % Edges(EdgeNumber) % NodeIndexes(1) .AND. &
+                  RefElement % NodeIndexes(k) /= &
+                  RefMesh % Edges(EdgeNumber) % NodeIndexes(2) ) EXIT
+          END DO
+
+!         New element 1
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+               RefElement % NodeIndexes(k)
+
+          l = 1
+          DO k = 1,3
+             IF ( k /= j ) THEN
+                l = l + 1
+                NewMesh % Elements(NewElCnt) % NodeIndexes(l) = &
+                     MarkedOrder(RefElement % EdgeIndexes(k))
+             END IF
+          END DO
+
+          Children(i,1) = NewElCnt
+
+!         New element 2
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          l = 0
+          DO k = 1,3
+             IF ( k /= j ) THEN
+                l = l + 1
+                NewMesh % Elements(NewElCnt) % NodeIndexes(l) = &
+                     MarkedOrder(RefElement % EdgeIndexes(k))
+             END IF
+          END DO
+
+          MaxLength = 0.0d0
+          DO k = 1,3
+             IF ( k /= j ) THEN
+                EdgeNumber = RefElement % EdgeIndexes(k)
+                Node1 = RefMesh % Edges( EdgeNumber ) % NodeIndexes(1)
+                Node2 = RefMesh % Edges( EdgeNumber ) % NodeIndexes(2)
+                x1 = RefMesh % Nodes % x( Node1 )
+                x2 = RefMesh % Nodes % x( Node2 )
+                y1 = RefMesh % Nodes % y( Node1 )
+                y2 = RefMesh % Nodes % y( Node2 )
+                EdgeLength = SQRT((x2-x1)**2+(y2-y1)**2)
+                IF (EdgeLength >= MaxLength) THEN
+                   MaxLength = EdgeLength
+                   LongestEdge = k
+                END IF
+             END IF
+          END DO
+          k = LongestEdge
+          IF ( k <= 0 .OR. k > 3 ) PRINT *,'longest edge:',k
+
+          IF ( RefMesh % Edges(RefElement % EdgeIndexes(j)) % NodeIndexes(1) ==  &
+               RefMesh % Edges(RefElement % EdgeIndexes(k)) % NodeIndexes(1) .OR.&
+               RefMesh % Edges(RefElement % EdgeIndexes(j)) % NodeIndexes(1) ==  &
+               RefMesh % Edges(RefElement % EdgeIndexes(k)) % NodeIndexes(2) ) THEN
+             NewMesh % Elements(NewElCnt) % NodeIndexes(3) = &
+                  RefMesh % Edges(RefElement % EdgeIndexes(j)) % NodeIndexes(2)
+          ELSE
+             NewMesh % Elements(NewElCnt) % NodeIndexes(3) = &
+                  RefMesh % Edges(RefElement % EdgeIndexes(j)) % NodeIndexes(1)
+          END IF
+
+          Children(i,2) = NewElCnt
+
+!         New element 3
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          DO j = 1,3
+             EdgeNumber = RefElement % EdgeIndexes(j)
+             IF ( .NOT.EdgeSplitted( EdgeNumber ) ) EXIT             
+          END DO
+
+          DO k = 1,2
+             NewMesh % Elements(NewElCnt) % NodeIndexes(k) = &
+                  RefMesh % Edges(EdgeNumber) % NodeIndexes(k)
+          END DO
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(3) = &
+               MarkedOrder(RefElement % EdgeIndexes(LongestEdge))
+
+          Children(i,3) = NewElCnt
+
+!-------------------------------------------------------------------------
+       CASE(3)
+!         Bisect all the edges to give four new elements:
+!         -----------------------------------------------
+
+!         New element 1
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+               RefElement % NodeIndexes(1)
+
+          j = RefElement % EdgeIndexes(1)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(2) = MarkedOrder(j)
+
+          j = RefElement % EdgeIndexes(3)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(3) = MarkedOrder(j)
+
+          Children(i,1) = NewElCnt
+
+!         New element 2
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+               RefElement % NodeIndexes(2)
+
+          j = RefElement % EdgeIndexes(2)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(2) = MarkedOrder(j)
+
+          j = RefElement % EdgeIndexes(1)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(3) = MarkedOrder(j)
+
+          Children(i,2) = NewElCnt
+
+!         New element 3
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+               RefElement % NodeIndexes(3)
+
+          j = RefElement % EdgeIndexes(3)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(2) = MarkedOrder(j)
+
+          j = RefElement % EdgeIndexes(2)
+          NewMesh % Elements(NewElCnt) % NodeIndexes(3) = MarkedOrder(j)
+
+          Children(i,3) = NewElCnt
+
+!         New element 4
+!----------------------------------------------------
+          NewElCnt = NewElCnt + 1
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+
+          DO j=1,n
+             NewMesh % Elements(NewElCnt) % NodeIndexes(j) = &
+                  MarkedOrder( RefElement % EdgeIndexes(j) )
+          END DO
+
+          Children(i,4) = NewElCnt
+!----------------------------------------------------
+       END SELECT
+
+!----------------------------------------------------
+       DO j=1,4
+          k = Children(i,j)
+          IF ( k > 0 ) THEN
+             NewMesh % Elements(k) % Splitted = RefElement % Splitted-1
+          END IF
+       END DO
+    END DO
+
+
+    WRITE( Message, * ) 'Bulk element tables generation time (cpu-secs):  ',CPUTime()-t
+    CALL Info( 'SplitOneLevel', Message, Level=6 )
+    
+!
+!   Update boundary elements:
+!   -------------------------
+    t = CPUTime()
+    NewElCnt = NewMesh % NumberOfBulkElements
+    DO j = RefMesh % NumberOfBulkElements + 1, &
+       RefMesh % NumberOfBulkElements + &
+          RefMesh % NumberOfBoundaryElements
+
+       RefElement => RefMesh % Elements(j) % BoundaryInfo % Left
+       IF ( .NOT.ASSOCIATED( RefElement) ) &
+            RefElement => RefMesh % Elements(j) % BoundaryInfo % Right
+
+       IF ( ASSOCIATED( RefElement ) ) THEN
+          NULLIFY( Edge )
+          DO i=1,3
+             Edge => RefMesh % Edges(RefElement % EdgeIndexes(i))
+             IF ( Edge % NodeIndexes(1) == RefMesh % Elements(j) % NodeIndexes(1) .AND. &
+                  Edge % NodeIndexes(2) == RefMesh % Elements(j) % NodeIndexes(2) .OR.  &
+                  Edge % NodeIndexes(2) == RefMesh % Elements(j) % NodeIndexes(1) .AND. &
+                  Edge % NodeIndexes(1) == RefMesh % Elements(j) % NodeIndexes(2) ) EXIT
+          END DO
+          EdgeNumber = RefElement % EdgeIndexes(i)
+
+          RefElement => RefMesh % Elements(j)
+          n = RefElement % TYPE % NumberOfNodes
+            
+          IF ( EdgeSplitted(EdgeNumber) ) THEN
+!
+!            New element 1:
+!            --------------
+             NewElCnt = NewElCnt + 1
+             NewMesh % Elements(NewElCnt) = RefElement
+             NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+             CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+             NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+                  RefElement % NodeIndexes(1)
+             NewMesh % Elements(NewElCnt) % NodeIndexes(2) = &
+                  MarkedOrder(EdgeNumber)
+
+             ALLOCATE( NewMesh % Elements(NewElCnt) % BoundaryInfo )
+             NewMesh % Elements(NewElCnt) % BoundaryInfo = &
+                  RefElement % BoundaryInfo
+
+             NULLIFY( NewMesh % Elements(NewElCnt) % &
+                Boundaryinfo % RadiationFactors )
+               
+             CALL SetParents( NewMesh % Elements(NewElCnt), &
+                  NewMesh, Children, Edge )
+
+             Children(j,1) = NewElCnt
+               
+!
+!            New element 2:
+!            --------------
+             NewElCnt = NewElCnt + 1
+             NewMesh % Elements(NewElCnt) = RefElement
+             NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+             CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+             NewMesh % Elements(NewElCnt) % NodeIndexes(1) = &
+                  MarkedOrder(EdgeNumber)
+             NewMesh % Elements(NewElCnt) % NodeIndexes(2) = &
+                  RefElement % NodeIndexes(2)
+
+             ALLOCATE( NewMesh % Elements(NewElCnt) % BoundaryInfo )
+             NewMesh % Elements(NewElCnt) % BoundaryInfo = &
+                  RefElement % BoundaryInfo
+
+             NULLIFY( NewMesh % Elements(NewElCnt) % &
+                Boundaryinfo % RadiationFactors )
+
+             CALL SetParents( NewMesh % Elements(NewElCnt), &
+                  NewMesh, Children, Edge )
+
+             Children(j,2) = NewElCnt
+          ELSE
+!
+!            New element 1:
+!            --------------
+             NewElCnt = NewElCnt + 1
+             NewMesh % Elements(NewElCnt) = RefElement
+             NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+             CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+             NewMesh % Elements(NewElCnt) % NodeIndexes = &
+                  RefElement % NodeIndexes
+
+             ALLOCATE( NewMesh % Elements(NewElCnt) % BoundaryInfo )
+
+             NewMesh % Elements(NewElCnt) % BoundaryInfo = &
+                  RefElement % BoundaryInfo
+
+             NULLIFY( NewMesh % Elements(NewElCnt) % &
+                Boundaryinfo % RadiationFactors )
+            
+             CALL SetParents( NewMesh % Elements(NewElCnt), &
+                  NewMesh, Children, Edge )
+
+             Children(j,1) = NewElCnt
+          END IF
+       ELSE
+!
+!         New element 1, this is point element:
+!         -------------------------------------
+          NewElCnt = NewElCnt + 1
+          RefElement => RefMesh % Elements(j)
+          n = RefElement % TYPE % NumberOfNodes
+
+          NewMesh % Elements(NewElCnt) = RefElement
+          NewMesh % Elements(NewElCnt) % ElementIndex = NewElCnt
+          CALL AllocateVector( NewMesh % Elements(NewElCnt) % NodeIndexes,n )
+          NewMesh % Elements(NewElCnt) % NodeIndexes = &
+               RefElement % NodeIndexes
+               
+          ALLOCATE( NewMesh % Elements(NewElCnt) % BoundaryInfo )
+
+          NewMesh % Elements(NewElCnt) % BoundaryInfo = &
+               RefElement % BoundaryInfo
+ 
+          NULLIFY( NewMesh % Elements(NewElCnt) % &
+             Boundaryinfo % RadiationFactors )
+
+          NULLIFY( NewMesh % Elements(NewElCnt) % BoundaryInfo % Left )
+          NULLIFY( NewMesh % Elements(NewElCnt) % BoundaryInfo % Right )
+
+          Children(j,1) = NewElCnt
+       END IF
+    END DO
+
+    NewMesh % MaxBDOFs = RefMesh % MaxBDOFs
+    DO i = 1,NewMesh % NumberOfBulkElements+NewMesh % NumberOfBoundaryElements
+      RefElement => NewMesh % Elements(i)
+      NULLIFY( RefElement % PDefs )
+      NULLIFY( RefElement % DGIndexes )
+      NULLIFY( RefElement % EdgeIndexes )
+      NULLIFY( RefElement % FaceIndexes )
+      NULLIFY( RefElement % BubbleIndexes )
+      IF ( RefElement % BDOFs > 0 ) THEN
+        ALLOCATE( RefElement % BubbleIndexes(RefElement % BDOFs) )
+        DO j=1,RefElement % BDOFs
+          RefElement % BubbleIndexes(j) = NewMesh % MaxBDOFs*(i-1)+j
+        END DO
+      END IF
+
+      IF ( ASSOCIATED(RefElement % PDefs) ) THEN
+        PD => RefElement % PDefs
+        CALL AllocatePDefinitions(RefElement)
+        RefElement % PDefs = PD
+      END IF
+    END DO
+
+!
+!   Update Gebhart factors, if present and the current solver
+!   is a heat equation solver:
+!   ------------------------------------------------------------
+    IF ( ListGetLogical( Solver % Values, 'Radiation Solver', Found ) ) THEN
+      CALL UpdateGebhartFactors( RefMesh, NewMesh, Children )
+    END IF
+      
+    WRITE( Message, * ) 'Bndry element tables generation time (cpu-secs): ',CPUTime()-t
+    CALL Info( 'SplitOneLevel', Message, Level=6 )
+
+    DEALLOCATE( EdgeSplitted, MarkedOrder, Children )
+!------------------------------------------------------------------------------
+  END FUNCTION SplitOneLevel
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+  FUNCTION RGBRefinement(  EdgeSplitted,RefMesh ) RESULT(MarkedEdges)
+!------------------------------------------------------------------------------
+    IMPLICIT NONE
+
+    LOGICAL :: EdgeSplitted(:)
+    INTEGER :: MarkedEdges
+    TYPE(Mesh_t), POINTER :: RefMesh
+!------------------------------------------------------------------------------
+    LOGICAL :: MarkedEdgesFound
+    INTEGER :: i,j,EdgeNumber,HangingNodes,RGBIterations,Node1,Node2,&
+         LongestEdge
+    REAL(KIND=dp) :: x1,y1,x2,y2,EdgeLength,MaxLength
+!------------------------------------------------------------------------------
+    EdgeSplitted = .FALSE.
+
+!   Mark all three edges of the marked elements (RED refinement):
+!   -------------------------------------------------------------
+!     DO i = 1,RefMesh % NumberOfBulkElements
+!        IF ( RefMesh % Elements(i) % Splitted > 0 ) THEN
+!           DO j = 1,3
+!              EdgeNumber = RefMesh % Elements(i) % EdgeIndexes(j)
+!              EdgeSplitted( EdgeNumber ) = .TRUE.
+!           END DO
+!        END IF
+!     END DO
+
+!   Mark the longest edges of the marked elements (GREEN refinement):
+!   -----------------------------------------------------------------
+    DO i = 1,RefMesh % NumberOfBulkElements
+       IF ( RefMesh % Elements(i) % Splitted > 0 ) THEN
+          MaxLength   = 0.0D0
+          LongestEdge = 0
+          DO j = 1,3
+             EdgeNumber = RefMesh % Elements(i) % EdgeIndexes(j)
+             Node1 = RefMesh % Edges( EdgeNumber ) % NodeIndexes(1)
+             Node2 = RefMesh % Edges( EdgeNumber ) % NodeIndexes(2)
+             x1 = RefMesh % Nodes % x( Node1 )
+             x2 = RefMesh % Nodes % x( Node2 )
+             y1 = RefMesh % Nodes % y( Node1 )
+             y2 = RefMesh % Nodes % y( Node2 )
+             EdgeLength = SQRT((x2-x1)**2+(y2-y1)**2)
+             IF (EdgeLength >= MaxLength) THEN
+                MaxLength = EdgeLength
+                LongestEdge = EdgeNumber
+             END IF
+          END DO
+          EdgeSplitted( LongestEdge ) = .TRUE.
+       END IF
+    END DO
+
+    MarkedEdges = 0
+    DO i = 1,RefMesh % NumberOfEdges
+       IF ( EdgeSplitted(i) ) THEN
+          MarkedEdges = MarkedEdges + 1
+       END IF
+    END DO
+
+!   Mark longest edges until we have a RGB-refinement:
+!   --------------------------------------------------
+    RGBiterations = 0
+    DO WHILE( .TRUE. )
+       HangingNodes = 0
+       RGBiterations = RGBiterations+1
+       DO i = 1,RefMesh % NumberOfBulkElements
+            
+!         Check for marked edges and find the longest edge:
+!         -------------------------------------------------
+          MarkedEdgesFound = .FALSE.
+          LongestEdge      = 0
+          MaxLength        = 0.0d0
+          DO j = 1,3
+             EdgeNumber = RefMesh % Elements(i) % EdgeIndexes(j)
+             MarkedEdgesFound = MarkedEdgesFound.OR.EdgeSplitted(EdgeNumber)
+             Node1 = RefMesh % Edges(EdgeNumber) % NodeIndexes(1)
+             Node2 = RefMesh % Edges(EdgeNumber) % NodeIndexes(2)
+             x1 = RefMesh % Nodes % x( Node1 )
+             x2 = RefMesh % Nodes % x( Node2 )
+             y1 = RefMesh % Nodes % y( Node1 )
+             y2 = RefMesh % Nodes % y( Node2 )
+             EdgeLength = SQRT((x2-x1)**2+(y2-y1)**2)
+             IF (EdgeLength >= MaxLength) THEN
+                MaxLength = EdgeLength
+                LongestEdge = EdgeNumber
+             END IF
+          END DO
+          
+!         If there are marked edges, the longest edge must be one of them:
+!         ----------------------------------------------------------------
+          IF ( MarkedEdgesFound.AND.(.NOT.EdgeSplitted(LongestEdge)) ) THEN
+             HangingNodes = HangingNodes + 1
+             EdgeSplitted( LongestEdge ) = .TRUE.
+          END IF
+       END DO
+
+       IF( HangingNodes > 0) THEN
+          WRITE( Message, * ) 'RGB ',RGBiterations,' : ',HangingNodes,' new nodes'
+          CALL Info( 'RGBRefinement', Message, Level=6 )
+          MarkedEdges = MarkedEdges + HangingNodes
+       ELSE
+          EXIT
+       END IF
+    END DO
+!------------------------------------------------------------------------------
+  END FUNCTION RGBRefinement
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+! Find the parent elements to the splitted boundary element
+! among the children of the original parent element:
+! ---------------------------------------------------------
+!------------------------------------------------------------------------------
+  SUBROUTINE SetParents( Element, Mesh, Children, Edge )
+!------------------------------------------------------------------------------
+    TYPE(Element_t) :: Element
+    TYPE(Element_t), POINTER :: Edge
+
+    INTEGER :: Children(:,:)
+    TYPE(Mesh_t), POINTER :: Mesh
+
+    INTEGER j,k,l,n,i0,j0,k0
+
+    TYPE(Element_t), POINTER :: Child
+
+    n = Element % TYPE % NumberOfNodes
+
+    k = Edge % BoundaryInfo % Left % ElementIndex
+    NULLIFY( Child )
+    DO l=1,4
+       IF ( Children(k,l)>0 ) THEN
+          Child => Mesh % Elements( Children(k,l) )
+          i0 = 0
+          DO j0=1,n
+             DO k0=1,Child % TYPE % NumberOfNodes
+                IF ( Child % NodeIndexes(k0) == Element % NodeIndexes(j0) ) THEN
+                   i0 = i0 + 1 
+                   EXIT
+                END IF
+             END DO
+          END DO
+          IF ( i0 == n ) EXIT
+       END IF
+    END DO
+
+    IF ( l > 4 ) STOP 'Adaptive: parent 1 not found'
+        
+    Element % BoundaryInfo % Left  => Child
+    NULLIFY( Element % BoundaryInfo % Right )
+        
+    NULLIFY( Child )
+    IF ( ASSOCIATED(Edge % BoundaryInfo % Right) ) THEN
+       k = Edge % BoundaryInfo % Right % ElementIndex
+       DO l=1,4
+          IF ( Children(k,l)>0 ) THEN
+             Child => Mesh % Elements( Children(k,l) )
+             i0 = 0
+             DO j0=1,n
+                DO k0=1,Child % TYPE % NumberOfNodes
+                   IF ( Child % NodeIndexes(k0) == Element % NodeIndexes(j0) ) THEN
+                      i0 = i0 + 1 
+                      EXIT
+                   END IF
+                END DO
+             END DO
+             IF ( i0 == n ) EXIT
+          END IF
+       END DO
+           
+       Element % BoundaryInfo % Right => Child
+    END IF
+!------------------------------------------------------------------------------
+  END SUBROUTINE SetParents
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+  SUBROUTINE UpdateGebhartFactors( RefMesh,NewMesh,Children ) 
+!------------------------------------------------------------------------------
+    TYPE(Mesh_t), POINTER :: RefMesh,NewMesh
+    INTEGER :: Children(:,:)
+!------------------------------------------------------------------------------
+    INTEGER :: i,j,k,n,NewFactors,TARGET
+    REAL(KIND=dp) :: AreaParent,AreaChild
+    TYPE(Factors_t), POINTER :: Factors,ChildFactors
+!------------------------------------------------------------------------------
+!
+!   Count numbers of factors for the new boundary elements:
+!   -------------------------------------------------------
+    DO i=RefMesh % NumberOfBulkElements+1,RefMesh % NumberOfBulkElements + &
+         RefMesh % NumberOfBoundaryElements
+
+       Factors => RefMesh % Elements(i) % BoundaryInfo % RadiationFactors
+       IF ( .NOT. ASSOCIATED( Factors ) ) CYCLE
+
+       NewFactors = 0
+       DO k=1,Factors % NumberOfFactors
+          TARGET = Factors % Elements(k)
+          IF ( Children(TARGET,2) > 0 ) THEN
+             NewFactors = NewFactors + 2
+          ELSE
+             NewFactors = NewFactors + 1
+          END IF
+       END DO
+
+       IF (.NOT.ASSOCIATED(NewMesh % Elements(Children(i,1)) % &
+                BoundaryInfo % RadiationFactors) ) &
+         ALLOCATE(NewMesh % Elements(Children(i,1)) % BoundaryInfo % RadiationFactors)
+
+       NewMesh % Elements(Children(i,1)) % BoundaryInfo % &
+            RadiationFactors % NumberOfFactors = NewFactors
+
+       IF ( Children(i,2) > 0 ) THEN
+          IF (.NOT.ASSOCIATED(NewMesh % Elements(Children(i,2)) % &
+                BoundaryInfo % RadiationFactors) ) &
+            ALLOCATE(NewMesh % Elements(Children(i,2)) % BoundaryInfo % RadiationFactors)
+
+          NewMesh % Elements(Children(i,2)) % BoundaryInfo % &
+               RadiationFactors % NumberOfFactors = NewFactors
+       END IF
+    END DO
+
+!
+!   Update the factors:
+!   --------------------
+    DO i=RefMesh % NumberOfBulkElements+1,RefMesh % NumberOfBulkElements + &
+         RefMesh % NumberOfBoundaryElements
+
+       Factors => RefMesh % Elements(i) % BoundaryInfo % RadiationFactors
+       IF ( .NOT. ASSOCIATED( Factors ) ) CYCLE
+
+       AreaParent = ElementArea( RefMesh, RefMesh % Elements(i), &
+            RefMesh % Elements(i) % TYPE % NumberOfNodes )
+
+       n = Children(i,1)
+
+       AreaChild  = ElementArea( NewMesh, NewMesh % Elements(n), &
+            NewMesh % Elements(n) % TYPE % NumberOfNodes )
+
+       ChildFactors => NewMesh % Elements(n) % BoundaryInfo % RadiationFactors
+
+       CALL UpdateChildFactors( AreaParent, Factors, &
+            AreaChild, ChildFactors, Children )
+
+       n = Children(i,2)
+
+       IF ( n > 0 ) THEN
+          AreaChild = ElementArea( NewMesh, NewMesh % Elements(n), &
+               NewMesh % Elements(n) % TYPE % NumberOfNodes )
+
+          ChildFactors => NewMesh % Elements(n) % &
+               BoundaryInfo % RadiationFactors
+
+          CALL UpdateChildFactors( AreaParent, Factors, &
+               AreaChild, ChildFactors, Children )
+       END IF
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE UpdateGebhartFactors
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+  SUBROUTINE UpdateChildFactors( Area, Factors, AreaNew, NewFactors,Children )
+!------------------------------------------------------------------------------
+    REAL(KIND=dp) :: Area, AreaNew
+    INTEGER :: Children(:,:)
+    TYPE(Factors_t), POINTER :: Factors, NewFactors
+!------------------------------------------------------------------------------
+    INTEGER k,n,TARGET,NEW
+!------------------------------------------------------------------------------
+    ALLOCATE(NewFactors % Factors(NewFactors % NumberOfFactors))
+    ALLOCATE(NewFactors % Elements(NewFactors % NumberOfFactors))
+
+    NEW = 0
+    DO k=1,Factors % NumberOfFactors
+       TARGET = Factors % Elements(k)
+       n = Children(TARGET,1)
+
+       NEW = NEW + 1
+       NewFactors % Elements(NEW) = n
+       NewFactors % Factors(NEW)  = AreaNew * Factors % Factors(k) / Area
+            
+       n = Children(TARGET,2)
+       IF ( n > 0 ) THEN
+          NEW = NEW + 1
+          NewFactors % Elements(NEW) = n
+          NewFactors % Factors(NEW)  = AreaNew * Factors % Factors(k) / Area
+       END IF
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE UpdateChildFactors
+!------------------------------------------------------------------------------
+ 
+!------------------------------------------------------------------------------
+ END SUBROUTINE RefineMesh
+!------------------------------------------------------------------------------
+
+
+!------------------------------------------------------------------------------
+  FUNCTION ComputeError( Model, ErrorIndicator, RefMesh,  &
+       Quant, Perm, InsideResidual, EdgeResidual, BoundaryResidual ) RESULT(MaxError)
+!------------------------------------------------------------------------------
+    USE CRSMatrix
+    IMPLICIT NONE
+
+    TYPE(Mesh_t), POINTER :: RefMesh
+    TYPE(Model_t) :: Model
+    INTEGER :: Perm(:)
+    REAL(KIND=dp) :: ErrorIndicator(:), Quant(:), MaxError
+
+    INTERFACE
+       SUBROUTINE BoundaryResidual( Model,Edge,Mesh,Quant,Perm,Gnorm, Indicator)
+         USE Types
+         TYPE(Element_t), POINTER :: Edge
+         TYPE(Model_t) :: Model
+         TYPE(Mesh_t), POINTER :: Mesh
+         REAL(KIND=dp) :: Quant(:), Indicator(2), Gnorm
+         INTEGER :: Perm(:)
+       END SUBROUTINE BoundaryResidual
+
+       SUBROUTINE EdgeResidual( Model,Edge,Mesh,Quant,Perm, Indicator)
+         USE Types
+         TYPE(Element_t), POINTER :: Edge
+         TYPE(Model_t) :: Model
+         TYPE(Mesh_t), POINTER :: Mesh
+         REAL(KIND=dp) :: Quant(:), Indicator(2)
+         INTEGER :: Perm(:)
+       END SUBROUTINE EdgeResidual
+
+       SUBROUTINE InsideResidual( Model,Element,Mesh,Quant,Perm,Fnorm, Indicator)
+         USE Types
+         TYPE(Element_t), POINTER :: Element
+         TYPE(Model_t) :: Model
+         TYPE(Mesh_t), POINTER :: Mesh
+         REAL(KIND=dp) :: Quant(:), Indicator(2), Fnorm
+         INTEGER :: Perm(:)
+       END SUBROUTINE InsideResidual
+    END INTERFACE
+!------------------------------------------------------------------------------
+    TYPE(Element_t), POINTER :: Edge, Face, Boundary, Element
+    INTEGER :: i, j, k, Parent
+    REAL(KIND=dp), POINTER :: TempIndicator(:,:)
+    REAL(KIND=dp) :: LocalIndicator(2), Fnorm, LocalFnorm,s,s1,s2
+!------------------------------------------------------------------------------
+    CALL FindMeshEdges( RefMesh )
+
+    Fnorm = 0.0_dp
+    ErrorIndicator = 0.0_dp
+
+    CALL AllocateArray(TempIndicator,2,SIZE(ErrorIndicator))
+    TempIndicator = 0.0_dp
+!
+!   Bulk equation residuals:
+!   ------------------------
+    DO i=1,RefMesh % NumberOfBulkElements
+       Element => RefMesh % Elements(i)
+       CurrentModel % CurrentElement => Element
+
+       CALL InsideResidual( Model, Element, &
+             RefMesh, Quant, Perm, LocalFnorm, LocalIndicator )
+
+       Fnorm = Fnorm + LocalFnorm
+       TempIndicator(:,i) = TempIndicator(:,i) + LocalIndicator
+    END DO
+
+
+    SELECT CASE( CoordinateSystemDimension())
+    CASE(2)
+!
+!   Edge jumps (2D):
+!   ----------------
+    DO i = 1,RefMesh % NumberOfEdges
+       Edge => RefMesh % Edges(i)
+       CurrentModel % CurrentElement => Edge
+
+       IF ( .NOT. ASSOCIATED( Edge % BoundaryInfo ) ) CYCLE
+
+       IF ( ASSOCIATED( Edge % BoundaryInfo % Right ) ) THEN
+          CALL EdgeResidual( Model, Edge, RefMesh, Quant, Perm, LocalIndicator )
+
+          Parent = Edge % BoundaryInfo % Left % ElementIndex
+          TempIndicator( :,Parent ) = &
+               TempIndicator( :,Parent ) + LocalIndicator
+          
+          Parent = Edge % BoundaryInfo % Right % ElementIndex
+          TempIndicator( :,Parent ) = &
+               TempIndicator( :,Parent ) + LocalIndicator
+       END IF
+    END DO
+
+    CASE(3)
+!
+!   Face jumps (3D):
+!   ----------------
+
+    DO i = 1,RefMesh % NumberOfFaces
+       Face => RefMesh % Faces(i)
+       CurrentModel % CurrentElement => Face
+
+       IF ( .NOT. ASSOCIATED( Face % BoundaryInfo ) ) CYCLE
+
+       IF ( ASSOCIATED( Face % BoundaryInfo % Right ) ) THEN
+          CALL EdgeResidual( Model, Face, RefMesh, Quant, Perm, LocalIndicator )
+
+          Parent = Face % BoundaryInfo % Left % ElementIndex
+          TempIndicator( :,Parent ) = TempIndicator( :,Parent ) + LocalIndicator
+          
+          Parent = Face % BoundaryInfo % Right % ElementIndex
+          TempIndicator( :,Parent ) = TempIndicator( :,Parent ) + LocalIndicator
+       END IF
+    END DO
+    END SELECT
+
+!
+!   Boundary condition residuals:
+!   -----------------------------
+    DO i = RefMesh % NumberOfBulkElements + 1,  &
+           RefMesh % NumberOfBulkElements + RefMesh % NumberOfBoundaryElements
+
+       Boundary => RefMesh % Elements(i)
+       CurrentModel % CurrentElement => Boundary
+
+       IF ( Boundary % Type % ElementCode == 101 ) CYCLE
+
+       CALL BoundaryResidual( Model, Boundary, &
+             RefMesh, Quant, Perm, LocalFnorm, LocalIndicator )
+
+       Fnorm = Fnorm + LocalFnorm
+
+       IF ( ASSOCIATED( Boundary % BoundaryInfo % Left) ) THEN
+         Parent = Boundary % BoundaryInfo % Left % ElementIndex
+         IF ( Parent > 0 ) TempIndicator( :,Parent ) = &
+              TempIndicator( :,Parent ) + LocalIndicator
+       END IF
+          
+       IF ( ASSOCIATED( Boundary % BoundaryInfo % RIght) ) THEN
+         Parent = Boundary % BoundaryInfo % Right % ElementIndex
+         IF ( Parent > 0 ) TempIndicator( :,Parent ) = &
+              TempIndicator( :,Parent ) + LocalIndicator
+       END IF
+    END DO
+
+
+    s1 = SUM(TempIndicator(2,:))
+    S2 = SUM(TempIndicator(1,:))
+    
+    IF(ParEnv % PEs > 1 ) THEN
+      s1 = ParallelReduction(s1)
+      s2 = ParallelReduction(s2)
+      Fnorm = ParallelReduction(Fnorm) 
+    END IF
+          
+    s = SQRT(s1) / SQRT(s2)
+    ErrorIndicator = SQRT( TempIndicator(1,:)/(2*s) + s*TempIndicator(2,:)/2 )
+
+    IF ( Fnorm > AEPS ) THEN
+       ErrorIndicator = ErrorIndicator / SQRT(Fnorm)
+    END IF
+
+    MaxError = MAXVAL( ErrorIndicator )
+    IF(ParEnv % PEs>1) MaxError = ParallelReduction(MaxError,2)
+        
+    DEALLOCATE( TempIndicator )
+!------------------------------------------------------------------------------
+  END FUNCTION ComputeError
+!------------------------------------------------------------------------------
+
+!------------------------------------------------------------------------------
+SUBROUTINE FluxRecovery(Model, Solver, Mesh, ErrorIndicator, MaxError)
+!------------------------------------------------------------------------------
+! Flux recovery & a posteriori error estimation
+! The author of the flux recovery part: mika.malinen@csc.fi
+!------------------------------------------------------------------------------
+  IMPLICIT NONE
+  TYPE(Model_t) :: Model
+  TYPE(Solver_t) :: Solver
+  TYPE(Mesh_t), POINTER :: Mesh
+  REAL(KIND=dp) :: ErrorIndicator(:), MaxError
+!------------------------------------------------------------------------------
+  TYPE(Element_t),POINTER :: Element
+  TYPE(Variable_t), POINTER :: RTFlux, NodalLoads
+  TYPE(ValueList_t), POINTER :: RTSolverPars
+  TYPE(Element_t), POINTER :: Parent, Face
+  INTEGER, ALLOCATABLE :: VisitsCounter(:)
+  INTEGER, ALLOCATABLE, SAVE :: Indices(:), RT_Indices(:)
+  INTEGER, POINTER :: FaceMap(:,:)
+  LOGICAL, SAVE :: AllocationsDone = .FALSE.
+  LOGICAL :: Found, UseReactions, Parallel, PostSmoothing, BDM
+  LOGICAL :: ReverseSign(3), OrientationsMatch
+  INTEGER :: n, nb, nd, t, active  
+  INTEGER :: i, j, k, m, p, ni, nj, nd_rt, istat, ActiveFaceId
+  INTEGER :: i_r, j_r
+  REAL(KIND=dp) :: UK(3), s, R1, R2, w1, w2, detw, r_i, r_j, hK
+  REAL(KIND=dp) :: LinFun(8)   ! The size corresponds to RT_1(K)
+  REAL(KIND=dp) :: Err, SolNorm, SolNormEst, Est, APostEst, Est_K
+  REAL(KIND=dp), ALLOCATABLE :: RTFluxPost(:), ReactionWeights(:)
+  CHARACTER(LEN=:), ALLOCATABLE :: matpar_name, force_name 
+!------------------------------------------------------------------------------  
+
+  ! We need a variable 'RTFlux' that is constructed as an approximation in RT_1/BDM
+  !
+  RTFlux => VariableGet(Mesh % Variables, 'RTFlux')
+
+  IF (ASSOCIATED(RTFlux)) THEN
+    IF (.NOT. ASSOCIATED(RTFlux % Solver)) &
+        CALL Fatal('FluxRecovery', 'RTFlux variable is not associated with any solver')
+
+    RTSolverPars => GetSolverParams(RTFlux % Solver)
+    BDM = GetLogical(RTSolverPars, 'Second Kind Basis', Found)
+
+    ALLOCATE(CHARACTER(MAX_NAME_LEN)::force_name)
+    ALLOCATE(CHARACTER(MAX_NAME_LEN)::matpar_name)
+
+    matpar_name = ListGetString(RTSolverPars, 'Material Parameter Name', Found)
+    force_name = ListGetString(RTSolverPars, 'Body Force Name', Found)
+
+    n = SIZE(RTFlux % Values)
+    ALLOCATE( VisitsCounter(n), STAT=istat )
+    VisitsCounter = 0
+    RTFlux % Values(:) = 0.0d0
+
+    IF (.NOT. AllocationsDone) THEN
+      N = Mesh % MaxElementDOFs
+      ALLOCATE(Indices(N), RT_Indices(N), STAT=istat)
+      AllocationsDone = .TRUE.
+    ELSE
+      IF (SIZE(Indices) < Mesh % MaxElementDOFs) THEN
+        CALL Fatal('FluxRecovery', 'Mesh changed, the maximum counts of element DOFs are different?')
+      END IF
+    END IF
+  ELSE
+    CALL Fatal('FluxRecovery', 'RTFlux variable cannot be found')
+  END IF
+
+  
+  !------------------------------------------------------------------------------
+  ! Step I: 
+  ! Compute the values of linear functionals (that is, DOFs) to obtain the elementwise
+  ! representation of the flux (stress resultant) in RT_1(K) (or BDM(K)). We add the computed values
+  ! to entries of the variable which is suitable for defining a conforming approximation
+  ! in RT_1. A later averaging may be applied to ensure that a conforming approximation
+  ! in RT_1 is obtained.
+  !------------------------------------------------------------------------------
+  Active = GetNOFActive()
+  DO K=1,Active
+    Element => GetActiveElement(K)
+    IF (.NOT.(GetElementFamily(Element) == 3)) CYCLE
+
+    n  = Element % Type % NumberOfNodes
+    nd = MGetElementDOFs(Indices, Element, Solver)
+    nb = GetElementNOFBDOFs(Element, Solver)
+
+    IF (nb > 0) CALL Fatal('FluxRecovery', 'Bubbles in Global System = True assumed')
+    
+    UK(1:nd) = Solver % Variable % Values(Solver % Variable % Perm(Indices(1:nd)))
+
+    nd_rt = MGetElementDOFs(RT_Indices, Element, USolver = RTFlux % Solver)
+
+    ! Compute the values of DOFs for the representation in RT_1(K)
+    !
+    CALL EstimateError(UK, Element, n, nd, LinFun = LinFun, MatParName = matpar_name, &
+        ForceName = force_name)
+
+    DO i=1,nd_rt
+      j = RTFlux % Solver % Variable % Perm(RT_Indices(i))
+      RTFlux % Values(j) = RTFlux % Values(j) + LinFun(i)
+      VisitsCounter(j) = VisitsCounter(j) + 1
+    END DO
+  END DO
+
+  ! Averaging and applying the know constraints related to BCs. First, average:
+  !
+  DO i=1,SIZE(RTFlux % Values)
+    IF (VisitsCounter(i) > 1) THEN
+      RTFlux % Values(i) = RTFlux % Values(i) / VisitsCounter(i)
+    END IF
+  END DO
+
+  NodalLoads => NULL()
+  NodalLoads => VariableGet(Mesh % Variables, &      
+      GetVarName(Solver % Variable) // ' Loads' )
+
+  IF (.NOT. ASSOCIATED(NodalLoads)) THEN
+    UseReactions = .FALSE.
+  ELSE  
+    ! First, check whether there are reactions caused by BCs
+    !
+    IF (ALLOCATED(Solver % Matrix % ConstrainedDOF)) THEN
+      IF (COUNT(Solver % Matrix % ConstrainedDOF) > 0) THEN
+        UseReactions = .TRUE.
+      ELSE
+        UseReactions = .FALSE.
+      END IF
+    END IF
+  END IF
+
+  Apply_reactions: IF (UseReactions) THEN
+    !
+    ! Create data in order to average reactions 
+    !
+    ! First we tag DOFs on the model boundary by computing suitable weights
+    ! for averaging
+    ! TO DO: This should also be done for the DOFs which are associated with
+    !        point loads. They need not necessarily be on the boundary.
+    !        Smaller arrays could also be allocated by revising the code.
+    !
+    ALLOCATE(ReactionWeights(SIZE(Solver % Variable % Values)), STAT=istat)
+    ReactionWeights = 0
+    Parallel = ASSOCIATED(Mesh % ParallelInfo % GInterface)
+
+!    m = 0
+    count_shared_nodes: DO K=1, GetNOFBoundaryElements()
+      Element => GetBoundaryElement(K)
+      IF (.NOT.(GetElementFamily(Element) == 2)) CYCLE
+      IF (ActiveBoundaryElement()) THEN
+        n = Element % Type % NumberOfNodes
+        nd = MGetElementDOFs(Indices)
+        
+        IF (COUNT(Solver % Matrix % ConstrainedDOF(Solver % Variable % Perm(Indices(1:n)))) == n) THEN
+!          m = m + 1
+          hK = SQRT((Mesh % Nodes % x(Indices(2)) - Mesh % Nodes % x(Indices(1)))**2 + &
+              (Mesh % Nodes % y(Indices(2)) - Mesh % Nodes % y(Indices(1)))**2)
+          DO i=1,n
+            ReactionWeights(Indices(i)) = ReactionWeights(Indices(i)) + hK
+          END DO
+        END IF
+      END IF
+    END DO count_shared_nodes
+
+    ! Now, loop again to create the values of DOFs using the reactions. We already know what elements
+    ! should be inspected, so this could be made more efficient ...
+    !
+    w1 = 0.5d0 * (1.0d0 + 1.0d0/sqrt(3.0d0))
+    w2 = 0.5d0 * (1.0d0 - 1.0d0/sqrt(3.0d0))
+    detw = w1**2 - w2**2
+    
+    replace_boundary_dofs: DO K=1, GetNOFBoundaryElements()
+      Element => GetBoundaryElement(K)
+      IF (.NOT.(GetElementFamily(Element) == 2)) CYCLE
+      IF (ActiveBoundaryElement()) THEN
+        n = Element % Type % NumberOfNodes
+        nd = MGetElementDOFs(Indices)
+        
+        IF (COUNT(Solver % Matrix % ConstrainedDOF(Solver % Variable % Perm(Indices(1:n)))) == n) THEN
+          !
+          ! We need the parent to check the sign reversion
+          !
+          Parent => Element % BoundaryInfo % Left
+          IF (.NOT. ASSOCIATED(Parent)) THEN
+            Parent => Element % BoundaryInfo % Right
+          END IF
+          IF (.NOT. ASSOCIATED(Parent)) Call Fatal('FluxRecovery', 'A parent element is not defined')  
+          !
+          ! Identify the face representing the element among the faces of 
+          ! the parent element:
+          !
+          CALL PickActiveFace(Mesh, Parent, Element, Face, ActiveFaceId)
+          IF (ActiveFaceId == 0) Call Fatal('FluxRecovery', 'Cannot determine an element face')
+
+          CALL FaceElementOrientation(Parent, ReverseSign, ActiveFaceId)
+          
+          IF (IsLeftHanded(Parent)) THEN
+            IF (ReverseSign(ActiveFaceId)) THEN
+              s = 1.0d0
+            ELSE
+              s = -1.0d0
+            END IF
+          ELSE
+            IF (ReverseSign(ActiveFaceId)) THEN
+              s = -1.0d0
+            ELSE
+              s = 1.0d0
+            END IF
+          END IF
+          
+          FaceMap => GetEdgeMap(GetElementFamily(Parent))
+          i_r = Element % NodeIndexes(1)
+          j_r = Element % NodeIndexes(2)
+          IF (ReverseSign(ActiveFaceId)) THEN
+            i = Parent % NodeIndexes(FaceMap(ActiveFaceId,2))
+          ELSE
+            i = Parent % NodeIndexes(FaceMap(ActiveFaceId,1))
+          END IF
+          OrientationsMatch = i_r == i
+
+          hK = SQRT((Mesh % Nodes % x(Indices(2)) - Mesh % Nodes % x(Indices(1)))**2 + &
+              (Mesh % Nodes % y(Indices(2)) - Mesh % Nodes % y(Indices(1)))**2)
+          
+          IF (OrientationsMatch) THEN
+            R1 = s * NodalLoads % Values(Solver % Variable % Perm(i_r)) * hk / ReactionWeights(i_r)
+            R2 = s * NodalLoads % Values(Solver % Variable % Perm(j_r)) * hk / ReactionWeights(j_r)
+          ELSE
+            R1 = s * NodalLoads % Values(Solver % Variable % Perm(j_r)) * hK / ReactionWeights(j_r)
+            R2 = s * NodalLoads % Values(Solver % Variable % Perm(i_r)) * hK / ReactionWeights(i_r)
+          END IF
+
+          nd_rt = MGetElementDOFs(RT_Indices, Parent, USolver = RTFlux % Solver)
+
+!          print *, '=== the first DOF now/before', R1, &
+!              RTFlux % Values(RTFlux % Solver % Variable % Perm(RT_Indices(2*ActiveFaceId - 1)))
+!          print *, '=== the second DOF now/before', R2, &
+!              RTFlux % Values(RTFlux % Solver % Variable % Perm(RT_Indices(2*ActiveFaceId)))
+
+          ! Finally use the reactions to replace the values of DOFs on the boundary
+          !
+          IF (BDM) THEN
+            RTFlux % Values(RTFlux % Solver % Variable % Perm(RT_Indices(2*ActiveFaceId - 1))) = &
+                1.0d0/detw * (w1*R1 - w2*R2)
+            RTFlux % Values(RTFlux % Solver % Variable % Perm(RT_Indices(2*ActiveFaceId))) = &
+                1.0d0/detw * (-w2*R1 + w1*R2)
+          ELSE
+            RTFlux % Values(RTFlux % Solver % Variable % Perm(RT_Indices(2*ActiveFaceId - 1))) = R1
+            RTFlux % Values(RTFlux % Solver % Variable % Perm(RT_Indices(2*ActiveFaceId))) = R2
+          END IF
+        END IF
+      END IF
+    END DO replace_boundary_dofs
+  END IF Apply_reactions
+
+  !------------------------------------------------------------------------------
+  ! Step II: 
+  ! Equilibrate fluxes (stress resultants). This brings us back to the recovery
+  ! which is defined only in the local RT space.
+  ! Here the exact solution is also used to study the accuracy.
+  !------------------------------------------------------------------------------
+
+  PostSmoothing = .FALSE. ! Eliminated as this doesn't seem to be beneficial
+  IF (PostSmoothing) THEN
+    ALLOCATE(RTFluxPost(SIZE(RTFlux % Values)))
+    RTFluxPost(:) = 0.0d0
+    VisitsCounter(:) = 0
+  END IF
+  
+  Err = 0.0d0
+  SolNorm = 0.0d0
+  Est = 0.0d0
+  APostEst = 0.0d0
+  SolNormEst = 0.0d0
+  
+  Elementwise_equilibration: DO K=1,Active
+    Element => GetActiveElement(K)
+    IF (.NOT. (GetElementFamily(Element) == 3)) CYCLE
+
+    n  = Element % Type % NumberOfNodes
+    nd = MGetElementDOFs(Indices)
+    nb = GetElementNOFBDOFs()
+    IF (nb > 0) CALL Fatal('FluxRecovery', 'Bubbles in Global System = True assumed')
+    
+    UK(1:nd) = Solver % Variable % Values( Solver % Variable % Perm(Indices(1:nd)) )
+
+    nd_rt = MGetElementDOFs(RT_Indices, Element, USolver = RTFlux % Solver)
+
+    ! At the calling time, we still have the RT DOFs respecting the global continuity requirements
+    !
+    DO i=1,nd_rt
+      j = RTFlux % Solver % Variable % Perm(RT_Indices(i))
+      LinFun(i) = RTFlux % Values(j)
+    END DO
+    
+    CALL EstimateError(UK, Element, n, nd, PostLinFun = LinFun, &
+        APostEst_K = Est_K, SolNormEst=SolNormEst, MatParName = matpar_name, &
+        ForceName = force_name)
+
+    ! The following call could be used to run a verification case:
+!    CALL EstimateError(UK, Element, n, nd, Err, SolNorm, Est, APostEst, PostLinFun = LinFun, &
+!        APostEst_K = Est_K, SolNormEst=SolNormEst, MatParName = matpar_name, &
+!        ForceName = force_name)
+
+    ErrorIndicator(K) = SQRT(Est_K)
+
+    IF (PostSmoothing) THEN
+      DO i=1,nd_rt
+        j = RTFlux % Solver % Variable % Perm(RT_Indices(i))
+        RTFluxPost(j) = RTFluxPost(j) + LinFun(i)
+        VisitsCounter(j) = VisitsCounter(j) + 1
+      END DO
+    END IF
+    
+  END DO Elementwise_equilibration
+
+  IF (SolNormEst > AEPS) ErrorIndicator = (1.0d0 / SQRT(SolNormEst)) * ErrorIndicator
+  MaxError = MAXVAL(ErrorIndicator)
+  IF (ParEnv % PEs>1) MaxError = ParallelReduction(MaxError,2)
+  
+!  WRITE (*, '(A,E16.8)') 'Solution Norm = ', SQRT(ParallelReduction(SolNorm))
+!  WRITE (*, '(A,E16.8)') 'Error Norm = ', SQRT(ParallelReduction(Err))/SQRT(ParallelReduction(SolNorm))
+!  WRITE (*, '(A,E16.8)') 'Recovery Error Norm = ', SQRT(ParallelReduction(Est))/SQRT(ParallelReduction(SolNorm))
+!  WRITE (*, '(A,E16.8)') 'A posteriori Error = ', SQRT(ParallelReduction(APostEst))/SQRT(ParallelReduction(SolNorm))
+!  WRITE (*, '(A,E16.8)') 'A posteriori Error Est = ', SQRT(SUM(ErrorIndicator**2)) 
+!  WRITE (*, '(A,E16.8)') 'Efficiency Factor = ', SQRT(ParallelReduction(APostEst))/SQRT(ParallelReduction(Err))
+
+  
+  !
+  ! The following computation would average again to obtain the recovery field in the global RT_1 space
+  !
+  post_smoothing: IF (PostSmoothing) THEN
+
+    Err = 0.0d0
+    Est = 0.0d0
+    APostEst = 0.0d0
+    SolNorm = 0.0d0
+
+    ! Post averaging
+    !
+    DO i=1,SIZE(RTFlux % Values)
+      IF (VisitsCounter(i) > 1) THEN
+        RTFluxPost(i) = RTFluxPost(i) / VisitsCounter(i)
+      END IF
+    END DO
+
+    Err = 0.0d0
+    Est = 0.0d0
+    APostEst = 0.0d0
+    SolNorm = 0.0d0
+
+    DO K=1,Active
+      Element => GetActiveElement(K)
+      IF ( .NOT. (GetElementFamily(Element) == 3) ) CYCLE
+
+      n  = Element % Type % NumberOfNodes
+      nd = MGetElementDOFs(Indices)
+      nb = GetElementNOFBDOFs()
+      IF (nb > 0) CALL Fatal('FluxRecovery', 'Bubbles in Global System = True assumed')
+
+      UK(1:nd) = Solver % Variable % Values( Solver % Variable % Perm(Indices(1:nd)) )
+
+      nd_rt = MGetElementDOFs(RT_Indices, Element, USolver = RTFlux % Solver)
+
+      DO i=1,nd_rt
+        j = RTFlux % Solver % Variable % Perm(RT_Indices(i))
+        LinFun(i) = RTFluxPost(j)
+      END DO
+
+      CALL EstimateError(UK, Element, n, nd, Err, SolNorm, Est, APostEst, PostLinFun = LinFun, &
+          UseGiven = .TRUE., MatParName = matpar_name, ForceName = force_name)
+
+    END DO
+
+    WRITE (*, '(A,E16.8)') 'Solution Norm = ', SQRT(ParallelReduction(SolNorm))
+    WRITE (*, '(A,E16.8)') 'Error Norm = ', SQRT(ParallelReduction(Err))/SQRT(ParallelReduction(SolNorm))
+    WRITE (*, '(A,E16.8)') 'Estimated Error Norm = ', SQRT(ParallelReduction(Est))/SQRT(ParallelReduction(SolNorm))
+    WRITE (*, '(A,E16.8)') 'A posteriori Error Est = ', SQRT(ParallelReduction(APostEst))/SQRT(ParallelReduction(SolNorm))
+    WRITE (*, '(A,E16.8)') 'Efficiency Factor = ', SQRT(ParallelReduction(APostEst))/SQRT(ParallelReduction(Err))
+
+  END IF post_smoothing
+
+  
+CONTAINS
+
+!------------------------------------------------------------------------------
+  SUBROUTINE EstimateError(UK, Element, n, nd, Err, SolNorm, Est, APostEst, &
+      LinFun, PostLinFun, UseGiven, APostEst_K, SolNormEst, &
+      MatParName, ForceName)
+!------------------------------------------------------------------------------
+    REAL(KIND=dp), INTENT(IN) :: UK(:)
+    TYPE(Element_t), POINTER, INTENT(IN) :: Element    
+    INTEGER, INTENT(IN) :: n, nd
+    ! The following four arguments are related only to running a code verification case:
+    REAL(KIND=dp), OPTIONAL, INTENT(INOUT) :: Err, SolNorm, Est, APostEst
+    REAL(KIND=dp), OPTIONAL, INTENT(INOUT) :: LinFun(8)
+    REAL(KIND=dp), OPTIONAL, INTENT(INOUT) :: PostLinFun(8)
+    LOGICAL, OPTIONAL, INTENT(IN) :: UseGiven
+    REAL(KIND=dp), OPTIONAL, INTENT(INOUT) :: APostEst_K, SolNormEst
+    CHARACTER(LEN=*) :: MatParName, ForceName
+!--------------------------------------------------------------------------------
+    TYPE(ValueList_t), POINTER :: BodyForce, Material
+    
+    REAL(KIND=dp) :: FBasis(8,3), DivFBasis(8), Mass(11,11), RHS(11), c(11), d(11), s
+    REAL(KIND=dp) :: Basis(nd), dBasis(nd,3), DetJ, xt, uq, vq, weight, EA, f
+    REAL(KIND=dp) :: U, gradU(3), Uh, gradUh(3), Nh(3), intf, divN, totflux, dc
+    REAL(KIND=dp) :: testfun(2), diff_coeff(n), Load(n)
+    REAL(KIND=dp) :: faceflux(3), faceweights(3), facedelta(3)
+    REAL(KIND=dp) :: w1, w2
+    LOGICAL :: Stat, Found
+    LOGICAL :: ReverseSign(3), LeftHanded, Parallel, UseLM
+    LOGICAL :: FirstOrderEquilibration 
+    INTEGER, POINTER :: EdgeMap(:,:)
+    INTEGER :: t, i, j, p, q, ni, nj, np, FDOFs, DOFs, ElementOrder
+    TYPE(GaussIntegrationPoints_t) :: IP
+
+    TYPE(Nodes_t), SAVE :: Nodes
+!------------------------------------------------------------------------------
+    IF (BDM) THEN
+      FDOFs = 6
+      ElementOrder = 1
+      FirstOrderEquilibration = .FALSE.
+    ELSE
+      FDOFs = 8
+      ElementOrder = 2
+      FirstOrderEquilibration = .TRUE.
+    END IF
+
+    UseLM = .TRUE.
+    IF (UseLM) THEN
+      IF (BDM) THEN
+        DOFs = FDOFs + 1
+      ELSE
+        DOFs = FDOFs + 3
+      END IF
+    ELSE
+      DOFs = FDOFs
+    END IF
+       
+    CALL GetElementNodes( Nodes )
+    IP = GaussPoints(Element, EdgeBasis=.TRUE., PReferenceElement=.TRUE., EdgeBasisDegree=2)
+
+    Material => GetMaterial()
+    diff_coeff(1:n) = GetReal(Material, MatParName)
+
+    IF (PRESENT(APostEst_K)) APostEst_K = 0.0d0
+    
+    c = 0.0d0
+    IF (PRESENT(UseGiven) .AND. PRESENT(PostLinFun)) THEN
+      IF (UseGiven) THEN
+        c(1:FDOFs) = PostLinFun(1:FDOFs)
+        GOTO 303
+      END IF
+    END IF
+
+    Load = 0.0d0
+    BodyForce => GetBodyForce()
+    IF (ASSOCIATED(BodyForce)) &
+        Load(1:n) = GetReal(BodyForce, ForceName, Found)
+    
+    IF (PRESENT(LinFun)) THEN
+      !
+      ! Compute a local representation of the flux in the elementwise RT_1(K) space.
+      ! The elementwise weak formulation is of the form
+      !           1/k (N,v) = -(u,div v) + <u,v.n> 
+      !
+      Parallel = ASSOCIATED(Mesh % ParallelInfo % GInterface)
+      EdgeMap => GetEdgeMap(3)
+      CALL FaceElementOrientation(Element, ReverseSign)
+
+      Mass = 0.0_dp
+      RHS = 0.0_dp
+      IF (BDM) THEN 
+        w1 = 0.5d0 * (1.0d0 + 1.0d0/sqrt(3.0d0))
+        w2 = 0.5d0 * (1.0d0 - 1.0d0/sqrt(3.0d0))
+      !ELSE
+      !  w1 = 1.0d0
+      !  w2 = 0.0d0
+      END IF
+      
+      DO t=1,IP % n
+
+        stat = FaceElementInfo(Element, Nodes, IP % U(t), IP % V(t), &
+            IP % W(t), detF=detJ, Basis=Basis, FBasis=FBasis, &
+            DivFBasis=DivFBasis, BDM=BDM, BasisDegree=ElementOrder, ApplyPiolaTransform=.TRUE., &
+            LeftHanded=LeftHanded)
+
+        Weight = IP % s(t) * DetJ
+
+        Uh = SUM(UK(1:nd) * Basis(1:nd))
+        EA = SUM(diff_coeff(1:n) * Basis(1:n))
+        
+        DO p=1,FDOFs
+          DO q=1,FDOFs
+            Mass(p,q) = Mass(p,q) + SUM(FBasis(q,1:2) * FBasis(p,1:2)) * Weight / EA
+          END DO
+          RHS(p) = RHS(p) - Weight * Uh * DivFBasis(p)
+        END DO
+        
+        IF (UseLM) THEN
+          !
+          ! Enforce the zeroth-order equilibration by using a Lagrange multiplier
+          !
+          f = SUM(Load(1:n) * Basis(1:n))
+          RHS(FDOFs+1) = RHS(FDOFs+1) + Weight * f
+
+          IF (FirstOrderEquilibration) THEN
+            !
+            ! Enforce the first-order equilibration by using a Lagrange multiplier
+            !
+            testfun(1) = Basis(2) - Basis(1)
+            testfun(2) = Basis(3) - Basis(1)
+            DO p=1,FDOFs
+              Mass(10,p)= Mass(10,p) - divFBasis(p) * testfun(1) * Weight
+              Mass(11,p)= Mass(11,p) - divFBasis(p) * testfun(2) * Weight
+              RHS(10) = RHS(10) + f * testfun(1) * Weight
+              RHS(11) = RHS(11) + f * testfun(2) * Weight
+              Mass(p,10)= Mass(p,10) - divFBasis(p) * testfun(1) * Weight
+              Mass(p,11)= Mass(p,11) - divFBasis(p) * testfun(2) * Weight
+            END DO
+          END IF
+        END IF
+      END DO
+
+      ! Assemble the boundary terms:
+      ! Loop over all faces (here edges)
+      !
+      DO p=1,3
+        ! Check whether the sign is reversed
+        IF (LeftHanded) THEN
+          IF (ReverseSign(p)) THEN
+            s = 1.0d0
+          ELSE
+            s = -1.0d0
+          END IF
+        ELSE
+          IF (ReverseSign(p)) THEN
+            s = -1.0d0
+          ELSE
+            s = 1.0d0
+          END IF
+        END IF
+        ! Check the order of basis functions
+        i = EdgeMap(p,1)
+        j = EdgeMap(p,2)
+        ni = Element % NodeIndexes(i)
+        IF (Parallel) ni = Mesh % ParallelInfo % GlobalDOFs(ni)             
+        nj = Element % NodeIndexes(j)
+        IF (Parallel) nj = Mesh % ParallelInfo % GlobalDOFs(nj)
+
+        IF (BDM) THEN
+          IF (nj<ni) THEN
+            RHS(2*p-1) = RHS(2*p-1) + s * (w2 * UK(i) + w1 * UK(j))
+            RHS(2*p) = RHS(2*p) + s * (w1 * UK(i) + w2 * UK(j))
+          ELSE
+            RHS(2*p-1) = RHS(2*p-1) + s * (w1 * UK(i) + w2 * UK(j))
+            RHS(2*p) = RHS(2*p) + s * (w2 * UK(i) + w1 * UK(j))
+          END IF
+        ELSE
+          ! The value of RHS vector is just the nodal DOF up to the sign
+          IF (nj<ni) THEN
+            ! The first weight function is s * basis(j)
+            RHS(2*p-1) = RHS(2*p-1) + s * UK(j)
+            RHS(2*p) = RHS(2*p) + s * UK(i)
+          ELSE
+            RHS(2*p-1) = RHS(2*p-1) + s * UK(i)
+            RHS(2*p) = RHS(2*p) + s * UK(j)
+          END IF
+        END IF
+          
+        IF (UseLM) THEN
+          Mass(FDOFs+1,2*p-1) = -s
+          Mass(FDOFs+1,2*p) = -s
+          Mass(2*p-1,FDOFs+1) = -s
+          Mass(2*p,FDOFs+1) = -s
+        END IF
+        
+      END DO
+
+      ! Finally solve the local representation of the flux
+      CALL InvertMatrix(Mass(1:DOFs,1:DOFs), DOFs)
+      c(1:DOFs) = MATMUL(MASS(1:DOFs,1:DOFs), RHS(1:DOFs))
+      LinFun(1:FDOFs) = c(1:FDOFs)
+      RETURN
+    END IF
+
+    IF (PRESENT(PostLinFun)) THEN
+      c(1:FDOFs) = PostLinFun(1:FDOFs)
+
+      EdgeMap => GetEdgeMap(3)
+      CALL FaceElementOrientation(Element, ReverseSign)
+      Parallel = ASSOCIATED(Mesh % ParallelInfo % GInterface)
+      
+      IF (.NOT. BDM) THEN
+        !
+        ! Perform the zeroth-order equilibration (note that BDM does not seem to benefit
+        ! from this):
+        !
+        intf = 0.0d0
+        divN = 0.0d0
+        
+        DO t=1,IP % n
+
+          stat = FaceElementInfo(Element, Nodes, IP % U(t), IP % V(t), &
+              IP % W(t), detF=detJ, Basis=Basis, FBasis=FBasis, &
+              DivFBasis=DivFBasis, BDM=BDM, BasisDegree=ElementOrder, ApplyPiolaTransform=.TRUE., &
+              LeftHanded=LeftHanded)
+
+          Weight = IP % s(t) * DetJ
+          f = SUM(Load(1:n) * Basis(1:n))
+          intf = intf + f * Weight
+        END DO
+
+        ! Loop over all faces (here edges)
+        !
+        totflux = 0.0d0
+        faceflux = 0.0d0
+        DO p=1,3
+          IF (LeftHanded) THEN
+            IF (ReverseSign(p)) THEN
+              s = 1.0d0
+            ELSE
+              s = -1.0d0
+            END IF
+          ELSE
+            IF (ReverseSign(p)) THEN
+              s = -1.0d0
+            ELSE
+              s = 1.0d0
+            END IF
+          END IF
+          totflux = totflux + s*(c(2*p-1)+c(2*p))
+          faceflux(p) = faceflux(p) + s*(c(2*p-1)+c(2*p))
+!          IF (c(2*p-1)*c(2*p) < 0.0 .AND. -c(2*p-1)*c(2*p)/(MAXVAL(ABS(c(:))))**2 > 1.0d-16) THEN
+!            CALL Warn('FluxRecovery', 'No consensus on flux sign')
+!            print *, 'c1', c(2*p-1)
+!            print *, 'c2', c(2*p)
+!          END IF
+        END DO
+
+        DO p=1,3
+          FaceWeights(p) = abs(faceflux(p))/sum(abs(faceflux(:)))
+        END DO
+        
+!        print *, 'total flux out', totflux
+!        print *, 'sources tot', -intf
+!        print *, 'change flux out by an amount', -intf - totflux
+!        dc = (-intf - totflux)/6.0d0
+        
+        DO p=1,3
+          facedelta(p) = FaceWeights(p) * (-intf - totflux)   
+        END DO        
+        !
+        ! The redefinition to ensure the zeroth-order equilibration:
+        !
+        DO p=1,3
+          IF (LeftHanded) THEN
+            IF (ReverseSign(p)) THEN
+              s = 1.0d0
+            ELSE
+              s = -1.0d0
+            END IF
+          ELSE
+            IF (ReverseSign(p)) THEN
+              s = -1.0d0
+            ELSE
+              s = 1.0d0
+            END IF
+          END IF
+          
+!          d(2*p-1) = c(2*p-1) + s*dc
+!          d(2*p) = c(2*p) + s*dc
+          d(2*p-1) = c(2*p-1) + s*facedelta(p)*0.5d0
+          d(2*p) = c(2*p) + s*facedelta(p)*0.5d0
+        END DO
+
+        post_check: IF (.TRUE.) THEN
+          totflux = 0.0d0
+          DO p=1,3
+            IF (LeftHanded) THEN
+              IF (ReverseSign(p)) THEN
+                s = 1.0d0
+              ELSE
+                s = -1.0d0
+              END IF
+            ELSE
+              IF (ReverseSign(p)) THEN
+                s = -1.0d0
+              ELSE
+                s = 1.0d0
+              END IF
+            END IF
+            
+            totflux = totflux + s*(d(2*p-1)+d(2*p))
+          END DO
+
+          IF (ABS(intf + totflux) > 1.0d1 * AEPS) THEN 
+            print *, 'Warning: change flux out by an amount', -intf - totflux
+          END IF
+        END IF post_check
+
+        c(1:6) = d(1:6)
+      END IF
+
+      ! Apply the first-order equilibration
+      !
+      IF (FirstOrderEquilibration) THEN
+        Mass = 0.0_dp
+        RHS = 0.0_dp
+        
+        DO t=1,IP % n
+          
+          stat = FaceElementInfo(Element, Nodes, IP % U(t), IP % V(t), &
+              IP % W(t), detF=detJ, Basis=Basis, FBasis=FBasis, &
+              DivFBasis=DivFBasis, BasisDegree=2, ApplyPiolaTransform=.TRUE.)
+
+          Weight = IP % s(t) * DetJ
+          f = SUM(Load(1:n) * Basis(1:n))
+          
+          testfun(1) = Basis(2) - Basis(1)
+          testfun(2) = Basis(3) - Basis(1)
+
+          DO p=1,2
+            DO q=1,2
+              Mass(p,q) = Mass(p,q) - divFBasis(6+q) * testfun(p) * Weight
+            END DO
+            RHS(p) = RHS(p) + f * testfun(p) * Weight
+            DO q=1,6
+              RHS(p) = RHS(p) + c(q) * divFBasis(q) * testfun(p) * Weight
+            END DO
+          END DO
+        END DO
+        
+        CALL InvertMatrix(Mass(1:2,1:2),2)
+        c(7:8) = MATMUL(MASS(1:2,1:2), RHS(1:2))
+      END IF
+      PostLinFun(1:FDOFs) = c(1:FDOFs)
+    END IF
+    
+    ! Compute a posteriori estimate:
+303 CONTINUE
+    DO t=1,IP % n
+
+      ! Now get the face basis functions so that we can evaluate
+      ! the flux in terms of them
+      !
+      stat = FaceElementInfo(Element, Nodes, IP % U(t), IP % V(t), &
+            IP % W(t), detF=detJ, Basis=Basis, FBasis=FBasis, &
+            DivFBasis=DivFBasis, dBasisdx=dBasis, BDM=BDM, BasisDegree=ElementOrder, &
+            ApplyPiolaTransform=.TRUE.)
+
+      Weight = IP % s(t) * DetJ
+      
+      !  The exact solution:
+      IF (PRESENT(Err) .OR. PRESENT(SolNorm)) THEN
+        xt = SUM(Basis(1:n) * Nodes % x(1:n))
+        U = 1.0d0 - xt**2/9.0d0
+        gradU(:) = 0.0
+        gradU(1) = -2.0d0 * xt/9.0d0
+      END IF
+
+      Uh = SUM(UK(1:nd) * Basis(1:nd))
+      DO i=1,2
+        gradUh(i) = SUM(UK(1:nd) * dBasis(1:nd,i))
+      END DO
+      gradUh(3) = 0.0d0
+
+      EA = SUM(diff_coeff(1:n) * Basis(1:n))
+      Nh = 0.0d0
+      DO i=1,2
+        Nh(i) = SUM( c(1:FDOFs) * FBasis(1:FDOFs,i) )
+      END DO
+      
+      IF (.TRUE.) THEN
+        ! The error of flux
+        IF (PRESENT(Err)) Err = Err + &
+            SUM((EA * gradU(1:2) - EA * gradUh(1:2))**2) * Weight
+        IF (PRESENT(SolNorm)) SolNorm = SolNorm + &
+            SUM((EA * gradU(1:2))**2) * Weight
+        IF (PRESENT(SolNormEst)) SolNormEst = SolNormEst + &
+            SUM((Nh(1:2))**2) * Weight
+        
+        ! A posteriori estimate based on the recovery:
+        !
+        IF (PRESENT(Est)) Est = Est + SUM((EA * gradU(1:2) - Nh(1:2))**2) * Weight
+        IF (PRESENT(APostEst)) APostEst = APostEst + SUM((EA * gradUh(1:2) - Nh(1:2))**2) * Weight
+        IF (PRESENT(APostEst_K)) APostEst_K = APostEst_K + SUM((EA * gradUh(1:2) - Nh(1:2))**2) * Weight
+      ELSE
+        ! The error of the field
+        IF (PRESENT(Err)) Err = Err + &
+            (U - Uh)**2 * Weight
+        IF (PRESENT(SolNorm)) SolNorm = SolNorm + &
+            U**2 * Weight
+      END IF
+    END DO
+!------------------------------------------------------------------------------
+  END SUBROUTINE EstimateError
+!------------------------------------------------------------------------------
+  
+!------------------------------------------------------------------------------
+  FUNCTION IsLeftHanded(Element) RESULT(LeftHanded)
+!------------------------------------------------------------------------------
+    TYPE(Element_t), POINTER, INTENT(IN) :: Element
+    LOGICAL :: LeftHanded
+!------------------------------------------------------------------------------
+    TYPE(Nodes_t), SAVE :: Nodes
+    LOGICAL :: Stat
+    REAL(KIND=dp) :: Basis(Element % Type % NumberOfNOdes), DetJ
+    REAL(KIND=dp) :: FBasis(8,3)
+!------------------------------------------------------------------------------
+    CALL GetElementNodes(Nodes, Element)    
+    
+    stat = FaceElementInfo(Element, Nodes, 0.0d0, SQRT(3.0d0)/3.0d0, &
+            0.0d0, detF=detJ, Basis=Basis, FBasis=FBasis, &
+            BasisDegree=1, ApplyPiolaTransform=.TRUE., &
+            LeftHanded=LeftHanded)
+!------------------------------------------------------------------------------    
+  END FUNCTION IsLeftHanded
+!------------------------------------------------------------------------------  
+
+!------------------------------------------------------------------------------
+END SUBROUTINE FluxRecovery
+!------------------------------------------------------------------------------
+
+!------------------------------------------------------------------------------
+END MODULE Adaptive
+!-----------------------------------------------------------------------------
+
+SUBROUTINE RefineMeshExt(Model,Solver,Quant,Perm,InsideResidual,EdgeResidual,BoundaryResidual)
+  USE adaptive
+
+  IMPLICIT NONE
+
+  TYPE( Model_t ) :: Model
+  TYPE(Solver_t), TARGET :: Solver
+  REAL(KIND=dp) :: Quant(:)
+  INTEGER :: Perm(:)
+
+    INTERFACE
+       SUBROUTINE BoundaryResidual( Model,Edge,Mesh,Quant,Perm,Gnorm,Indicator )
+          USE Types
+          TYPE(Element_t), POINTER :: Edge
+          TYPE(Model_t) :: Model
+          TYPE(Mesh_t), POINTER :: Mesh
+          REAL(KIND=dp) :: Quant(:), Indicator(2), Gnorm
+          INTEGER :: Perm(:)
+       END SUBROUTINE BoundaryResidual
+
+
+       SUBROUTINE EdgeResidual( Model,Edge,Mesh,Quant,Perm, Indicator)
+          USE Types
+          TYPE(Element_t), POINTER :: Edge
+          TYPE(Model_t) :: Model
+          TYPE(Mesh_t), POINTER :: Mesh
+          REAL(KIND=dp) :: Quant(:), Indicator(2)
+          INTEGER :: Perm(:)
+       END SUBROUTINE EdgeResidual
+
+
+       SUBROUTINE InsideResidual( Model,Element,Mesh,Quant,Perm,Fnorm, Indicator)
+          USE Types
+          TYPE(Element_t), POINTER :: Element
+          TYPE(Model_t) :: Model
+          TYPE(Mesh_t), POINTER :: Mesh
+          REAL(KIND=dp) :: Quant(:), Indicator(2), Fnorm
+          INTEGER :: Perm(:)
+       END SUBROUTINE InsideResidual
+    END INTERFACE
+
+  CALL RefineMesh( Model,Solver,Quant,Perm, &
+            InsideResidual, EdgeResidual, BoundaryResidual )
+END SUBROUTINE RefineMeshExt
+
+!------------------------------------------------------------------------------
+
+!> \} 
