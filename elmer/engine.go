@@ -14,6 +14,7 @@ import (
 
 	"oblikovati.org/api/client"
 	"oblikovati.org/api/wire"
+	"oblikovati.org/elmer/elmer/femmodel"
 )
 
 // HostCaller is the transport the engine talks to the host through — exactly the
@@ -28,13 +29,40 @@ type Engine struct {
 	host HostCaller
 	api  *client.Client
 
-	mu      sync.Mutex // guards running
-	running bool       // a study is in flight (coalesces overlapping triggers)
+	mu          sync.Mutex         // guards analysis, resultField, running
+	analysis    *femmodel.Analysis // tree-owned source of truth (Mesh/Material/Load)
+	resultField string             // M1: "vonmises" | "displacement" (engine-only, see panel.go's applyResultEdit)
+	running     bool               // a study is in flight (coalesces overlapping triggers)
+
+	// solve runs the resolved deck in dir and returns ElmerSolver's combined stdout — a
+	// stubbable seam (defaults to runElmerSolver) so tests can drive the whole pipeline
+	// without a real solve.
+	solve func(dir string) (string, error)
 }
 
-// NewEngine binds the engine to the host transport.
+// NewEngine binds the engine to the host transport with the default study parameters.
 func NewEngine(host HostCaller) *Engine {
-	return &Engine{host: host, api: client.New(host)}
+	return &Engine{
+		host: host, api: client.New(host),
+		analysis:    femmodel.NewDefaultAnalysis(),
+		resultField: resultFieldVonMises,
+		solve:       runElmerSolver,
+	}
+}
+
+// study snapshots the study model under lock and projects it to the flat StudySettings the
+// pipeline consumes — the ONE seam the mesh/deck/solve/render path reads.
+func (e *Engine) study() StudySettings {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return projectAnalysis(e.analysis)
+}
+
+// resultFieldKind returns the panel-selected result field under lock.
+func (e *Engine) resultFieldKind() string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.resultField
 }
 
 // Notify receives host event bytes. A command.started carrying RunStudyCommandID runs the
@@ -50,13 +78,18 @@ func (e *Engine) Notify(ev []byte) {
 	if json.Unmarshal(ev, &hdr) != nil {
 		return
 	}
-	if hdr.Type == wire.EventCommandStarted {
+	switch hdr.Type {
+	case wire.EventCommandStarted:
 		e.onCommandStarted(ev)
+	case wire.EventPanelValueChanged:
+		e.onPanelValueChanged(ev)
 	}
 }
 
 // onCommandStarted dispatches our registered commands. The study runs through launchStudy's
-// coalescing guard, off the session goroutine (see Notify).
+// coalescing guard, off the session goroutine (see Notify); ShowPanel makes a host call
+// (DockableWindows().Set), so it too must run off the session goroutine to avoid the
+// dispatcher deadlock.
 func (e *Engine) onCommandStarted(ev []byte) {
 	var c struct {
 		Command string `json:"command"`
@@ -64,8 +97,24 @@ func (e *Engine) onCommandStarted(ev []byte) {
 	if json.Unmarshal(ev, &c) != nil {
 		return
 	}
-	if c.Command == RunStudyCommandID {
+	switch c.Command {
+	case RunStudyCommandID:
 		e.launchStudy()
+	case ShowPanelCommandID:
+		go func() { _, _ = e.ShowPanel() }()
+	}
+}
+
+// onPanelValueChanged applies a panel edit. Editing a parameter only mutates engine state
+// (no host call) — safe to run inline on the session goroutine.
+func (e *Engine) onPanelValueChanged(ev []byte) {
+	var p struct {
+		WindowId  string `json:"windowId"`
+		ControlId string `json:"controlId"`
+		Value     string `json:"value"`
+	}
+	if json.Unmarshal(ev, &p) == nil && p.WindowId == PanelID {
+		e.applyPanelEdit(p.ControlId, p.Value)
 	}
 }
 
@@ -85,7 +134,7 @@ func (e *Engine) launchStudy() {
 
 // runAndReport runs one study and reports its outcome, recovering from any panic in the
 // pipeline so a bug cannot take down the in-process host — the failure is surfaced on the
-// status bar instead. Task 11 fills in the real pipeline; until then it reports not-implemented.
+// status bar instead.
 func (e *Engine) runAndReport() {
 	defer func() {
 		e.mu.Lock()
@@ -95,7 +144,12 @@ func (e *Engine) runAndReport() {
 			e.reportStatus(fmt.Sprintf("Elmer study crashed: %v", r))
 		}
 	}()
-	e.reportStatus("Elmer: not implemented yet")
+	res, err := e.runStudy()
+	if err != nil {
+		e.reportStatus("Elmer study failed: " + err.Error())
+		return
+	}
+	e.reportStatus(res.Summary())
 }
 
 // reportStatus surfaces a study's outcome on the host status bar (best-effort: a status

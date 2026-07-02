@@ -11,9 +11,8 @@ import (
 // the MCP bridge's execute_command) runs the FEA study on the active part.
 const RunStudyCommandID = "Elmer.RunStudy"
 
-// ShowPanelCommandID re-opens the study-parameters panel from the ribbon. The panel itself
-// (and its dispatch in Notify) lands in a later task; the command is registered now so the
-// ribbon button exists from M0.
+// ShowPanelCommandID re-opens the study-parameters panel from the ribbon. Registered here
+// since M0; dispatched to (*Engine).ShowPanel by engine.go's onCommandStarted (Task 12).
 const ShowPanelCommandID = "Elmer.ShowPanel"
 
 // elmerRibbonTab is the shared FEA document ribbon tab Elmer places its commands on (spec §15

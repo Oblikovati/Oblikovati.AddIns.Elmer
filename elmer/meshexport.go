@@ -66,8 +66,7 @@ func exportMesh(m *TetMesh, groups *FaceGroups, bound []BoundFace) (meshfmt.Mesh
 // Nodes to be dense (id = slice index + 1); compacting through this map keeps that
 // contract even if a future multi-body merge leaves gaps in the id space.
 func exportNodes(m *TetMesh) ([][3]float64, map[int]int) {
-	sorted := append([]Node(nil), m.Nodes...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	sorted := sortNodesByID(m.Nodes)
 	nodes := make([][3]float64, len(sorted))
 	index := make(map[int]int, len(sorted))
 	for i, n := range sorted {
@@ -75,6 +74,28 @@ func exportNodes(m *TetMesh) ([][3]float64, map[int]int) {
 		index[n.ID] = i + 1
 	}
 	return nodes, index
+}
+
+// compactNodeIndex maps each node's original TetMesh id to its compact 1-based meshfmt
+// index, in ascending-id order — the same mapping exportNodes builds, exposed standalone
+// for render.go: ElmerSolver writes its VTU result points in the same order
+// meshfmt.Write wrote mesh.nodes (this same ascending-id compaction), so a node's VTU
+// point index is compactNodeIndex(mesh.Nodes)[id]-1.
+func compactNodeIndex(nodes []Node) map[int]int {
+	sorted := sortNodesByID(nodes)
+	index := make(map[int]int, len(sorted))
+	for i, n := range sorted {
+		index[n.ID] = i + 1
+	}
+	return index
+}
+
+// sortNodesByID returns a copy of nodes sorted ascending by ID, the common ordering
+// exportNodes and compactNodeIndex both compact node ids against.
+func sortNodesByID(nodes []Node) []Node {
+	sorted := append([]Node(nil), nodes...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })
+	return sorted
 }
 
 // exportTets returns the mesh's tets in ascending-original-id order (mirroring
