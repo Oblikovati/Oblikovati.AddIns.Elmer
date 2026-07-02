@@ -54,3 +54,24 @@ func TestProjectAnalysisReflectsCustomValues(t *testing.T) {
 		t.Errorf("projectAnalysis(a) = %+v, did not track the mutated aggregate", got)
 	}
 }
+
+// TestProjectAnalysisZeroValueDegradesToDefaultEquation proves the M40 "silent degradation"
+// failure mode does not apply here as an outright panic: a legally-constructible zero-value
+// femmodel.Analysis{} has a nil Equations() slice, so projectAnalysis must not index it
+// unconditionally. It degrades gracefully to the same seeded default elasticity equation
+// NewDefaultAnalysis uses, and produces zero-valued Simulation/Mesh/Material/Load — deterministic,
+// not a panic.
+func TestProjectAnalysisZeroValueDegradesToDefaultEquation(t *testing.T) {
+	got := projectAnalysis(&femmodel.Analysis{})
+
+	want := StudySettings{
+		Simulation: femmodel.SolverObject{},
+		Mesh:       femmodel.MeshObject{},
+		Material:   femmodel.MaterialObject{},
+		Equation:   femmodel.DefaultElasticityEquation(),
+		Load:       femmodel.LoadDefaults{},
+	}
+	if got != want {
+		t.Errorf("projectAnalysis(&femmodel.Analysis{}) = %+v, want %+v", got, want)
+	}
+}

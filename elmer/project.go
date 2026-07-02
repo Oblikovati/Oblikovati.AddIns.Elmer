@@ -17,8 +17,12 @@ type StudySettings struct {
 }
 
 // projectAnalysis flattens a femmodel.Analysis into the StudySettings the pipeline consumes.
-// M1 seeds exactly one equation (Analysis.SetEquation never removes it, so index 0 always
-// exists); a multi-equation aggregate widens this projection in a later milestone.
+// M1 seeds exactly one equation via NewDefaultAnalysis (Analysis.SetEquation never removes it,
+// so a *constructed* aggregate's index 0 always exists); a multi-equation aggregate widens this
+// projection in a later milestone. A legally-constructible zero-value femmodel.Analysis{} (e.g.
+// from a caller that skips NewDefaultAnalysis) carries a nil Equations() slice instead — rather
+// than index out of range, projectAnalysis degrades gracefully to the same seeded default
+// elasticity equation NewDefaultAnalysis itself uses, so the projection is always deterministic.
 //
 // Example:
 //
@@ -29,7 +33,17 @@ func projectAnalysis(a *femmodel.Analysis) StudySettings {
 		Simulation: a.Solver(),
 		Mesh:       a.Mesh(),
 		Material:   a.DefaultMaterial(),
-		Equation:   a.Equations()[0],
+		Equation:   equationOrDefault(a),
 		Load:       a.LoadDefaults(),
 	}
+}
+
+// equationOrDefault returns the aggregate's first equation, or femmodel.DefaultElasticityEquation
+// when the aggregate carries none — the zero-value-Analysis degradation path documented on
+// projectAnalysis.
+func equationOrDefault(a *femmodel.Analysis) femmodel.EquationObject {
+	if eqs := a.Equations(); len(eqs) > 0 {
+		return eqs[0]
+	}
+	return femmodel.DefaultElasticityEquation()
 }

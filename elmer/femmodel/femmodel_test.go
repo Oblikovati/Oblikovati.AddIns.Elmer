@@ -2,7 +2,10 @@
 
 package femmodel
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestNewDefaultAnalysisSolver pins the M1 default simulation setup: steady state, Cartesian 3D,
 // converged in a single outer iteration (elasticity is linear).
@@ -151,7 +154,9 @@ func TestSetEquationReplacesWholeObject(t *testing.T) {
 }
 
 // TestSetEquationOutOfRangeErrors proves an out-of-range index errors, naming the offending
-// index and the current equation count — not a silent no-op or a panic.
+// index and the current equation count — not a silent no-op or a panic. Asserts the error text
+// itself (not just non-nil) so the "names the offending value" contract can't silently regress
+// to a generic message.
 func TestSetEquationOutOfRangeErrors(t *testing.T) {
 	a := NewDefaultAnalysis()
 	for _, i := range []int{-1, 1, 99} {
@@ -159,6 +164,14 @@ func TestSetEquationOutOfRangeErrors(t *testing.T) {
 		if err == nil {
 			t.Fatalf("SetEquation(%d, ...) = nil error, want an out-of-range error", i)
 		}
+	}
+
+	err := a.SetEquation(99, EquationObject{})
+	if !strings.Contains(err.Error(), "99") {
+		t.Errorf("SetEquation(99, ...) error = %q, want it to mention the offending index 99", err.Error())
+	}
+	if !strings.Contains(err.Error(), "1") {
+		t.Errorf("SetEquation(99, ...) error = %q, want it to mention the current count 1", err.Error())
 	}
 }
 

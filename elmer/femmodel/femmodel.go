@@ -67,10 +67,17 @@ type EquationObject struct {
 	CalculateStresses     bool
 }
 
-// newDefaultElasticityEquation returns the M1 reference elasticity solve: an iterative BiCGStab
+// DefaultElasticityEquation returns the M1 reference elasticity solve: an iterative BiCGStab
 // linear solve with ILU0 preconditioning (500 iterations, 1e-8 tolerance) inside a looser 1e-5
-// steady-state gate, with stress recovery enabled.
-func newDefaultElasticityEquation() EquationObject {
+// steady-state gate, with stress recovery enabled. Exported so elmer.projectAnalysis can fall
+// back to it when a zero-value Analysis carries no equations, without duplicating the literal
+// seed values (NewDefaultAnalysis uses this same function, so the two can never drift apart).
+//
+// Example:
+//
+//	eq := femmodel.DefaultElasticityEquation()
+//	eq.Kind // "elasticity"
+func DefaultElasticityEquation() EquationObject {
 	return EquationObject{
 		Kind:                  "elasticity",
 		LinearSolverType:      "Iterative",
@@ -124,12 +131,17 @@ func NewDefaultAnalysis() *Analysis {
 		solver:       newDefaultSolver(),
 		mesh:         newDefaultMesh(),
 		material:     newDefaultMaterial(),
-		equations:    []EquationObject{newDefaultElasticityEquation()},
+		equations:    []EquationObject{DefaultElasticityEquation()},
 		loadDefaults: newDefaultLoadDefaults(),
 	}
 }
 
 // Solver returns the study's single solver (simulation) object.
+//
+// Example:
+//
+//	sim := a.Solver()
+//	sim.SimulationType // "steady state"
 func (a *Analysis) Solver() SolverObject { return a.solver }
 
 // SetSolver replaces the solver object wholesale.
@@ -140,15 +152,33 @@ func (a *Analysis) Solver() SolverObject { return a.solver }
 func (a *Analysis) SetSolver(s SolverObject) { a.solver = s }
 
 // Mesh returns the study's single volume-mesh object.
+//
+// Example:
+//
+//	m := a.Mesh()
+//	m.Order // 2
 func (a *Analysis) Mesh() MeshObject { return a.mesh }
 
 // SetMesh replaces the mesh object wholesale.
+//
+// Example:
+//
+//	a.SetMesh(femmodel.MeshObject{Order: 1, MaxSizeMM: 2.5})
 func (a *Analysis) SetMesh(m MeshObject) { a.mesh = m }
 
 // DefaultMaterial returns the study's single material assignment.
+//
+// Example:
+//
+//	mat := a.DefaultMaterial()
+//	mat.Name // "steel"
 func (a *Analysis) DefaultMaterial() MaterialObject { return a.material }
 
 // SetDefaultMaterial replaces the material object wholesale.
+//
+// Example:
+//
+//	a.SetDefaultMaterial(femmodel.MaterialObject{Name: "aluminium", YoungGPa: 69, Poisson: 0.33, DensityGCm3: 2.70})
 func (a *Analysis) SetDefaultMaterial(m MaterialObject) { a.material = m }
 
 // Equations returns a defensive copy of the equation list: mutating the result never affects the
@@ -180,7 +210,16 @@ func (a *Analysis) SetEquation(i int, eq EquationObject) error {
 }
 
 // LoadDefaults returns the study's default-load template.
+//
+// Example:
+//
+//	l := a.LoadDefaults()
+//	l.LoadType // "force"
 func (a *Analysis) LoadDefaults() LoadDefaults { return a.loadDefaults }
 
 // SetLoadDefaults replaces the default-load template wholesale.
+//
+// Example:
+//
+//	a.SetLoadDefaults(femmodel.LoadDefaults{LoadType: "pressure", PressureMPa: 2.5})
 func (a *Analysis) SetLoadDefaults(l LoadDefaults) { a.loadDefaults = l }
