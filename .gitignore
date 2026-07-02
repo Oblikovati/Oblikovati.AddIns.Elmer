@@ -8,6 +8,20 @@
 *.so
 *.dylib
 
+# C ABI header vendored from the oblikovati.org/api module by `make sync-header`
+# (single source of truth lives in /api; we only -I it for cgo builds).
+/include/
+
+# c-shared library build output (make build)
+/build/
+
+# Vendored solver (vendor-src) build artifacts — sources are committed, the
+# compiled libraries/binaries are rebuilt by each vendor-src/*/build.sh.
+vendor-src/**/*.o
+vendor-src/**/*.a
+vendor-src/**/*.mod
+vendor-src/*/build/
+
 # Test binary, built with `go test -c`
 *.test
 
