@@ -60,12 +60,12 @@ func ObkAddInActivate(call C.ObkHostCall, freeFn C.ObkHostFree) C.int {
 	}
 	hostCall, hostFree = call, freeFn
 	engine = elmer.NewEngine(cgoHostCaller{})
-	// NOTE(Task 2): registering the study command must run OFF the session goroutine —
-	// Activate runs on the host's session goroutine before the frame loop starts, and a
-	// host call there blocks until the loop drains the dispatcher, so registering inline
-	// would deadlock the head (same pattern as the FEMM bridge + MCP bridge). The running
-	// frame loop drains this goroutine's host calls. Task 2 adds Engine.Setup() and the
-	// `go func() { _ = engine.Setup() }()` call here.
+	// Registering the study command must run OFF the session goroutine — Activate runs on
+	// the host's session goroutine before the frame loop starts, and a host call there
+	// blocks until the loop drains the dispatcher, so registering inline would deadlock the
+	// head (same pattern as the FEMM bridge + MCP bridge). The running frame loop drains
+	// this goroutine's host calls.
+	go func() { _ = engine.Start() }()
 	return C.OBK_OK
 }
 
