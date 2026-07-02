@@ -1,0 +1,32 @@
+Check Keywords "Warn"
+
+Header
+  Mesh DB "." "."
+End
+
+Simulation
+  Simulation Type = String "Steady State"
+End
+
+Body 1
+  Equation = Integer 1
+  Material = Integer 1
+  Target Bodies(1) = Integer 1
+End
+
+Material 1
+  Youngs Modulus = Real 2.1e+11
+End
+
+Equation 1
+  Active Solvers(1) = Integer 1
+End
+
+Solver 1
+  Procedure = "StressSolve" "StressSolver"
+End
+
+Boundary Condition 1
+  Displacement 1 = Real 0
+  Target Boundaries(1) = Integer 1
+End
