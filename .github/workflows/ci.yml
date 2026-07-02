@@ -110,7 +110,59 @@ jobs:
           name: oblikovati-elmer-${{ matrix.os }}
           path: build/oblikovati-elmer.*
 
-  # NOTE: the `solvers` job (build the vendored gmsh + ElmerSolver toolchain from source
-  # and validate each against a known case) is intentionally NOT here yet — the solver
-  # toolchain isn't vendored until Task 4 (gmsh) and Task 5 (elmerfem). Task 6 re-adds
-  # this job once vendor-src/{gmsh,elmer}/build.sh exist.
+  # Build the vendored solver toolchain from source — gmsh 4.13.1 (volume mesher) and
+  # ElmerSolver (multiphysics FEM, reference LAPACK/BLAS, no MPI/MUMPS/GUI) — and validate
+  # ElmerSolver against a known case: the hand-tessellated 5-tet cube under pure Z-tension
+  # with nu=0, whose max w-displacement is exact on ANY mesh (sigma*L/E = 1.0e-3 m). This
+  # is the self-contained, no-external-dependency toolchain the add-in ships and runs as
+  # subprocesses (vendor-src/{gmsh,elmer}/NOTICE.md).
+  # Linux is the gating platform for the from-source solver build (same rationale as the
+  # CalculiX add-in's solvers job, $CCX/.github/workflows/ci.yml): the macOS/Windows
+  # SHIPPED add-in (the cgo c-shared library) is still validated by the `build` job on
+  # all three OSes; building the vendored solver SOURCE on macOS is a follow-up.
+  solvers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - name: Install build toolchain
+        run: sudo apt-get update && sudo apt-get install -y gfortran cmake
+      # gmsh is the long pole cold (~20+ min); ElmerSolver+lapack is ~3-4 min. Cache both
+      # build trees keyed on their vendored source content so unchanged pushes to this
+      # branch skip most of the compile (build.sh reruns cmake --build, which is
+      # incremental against a warm cache).
+      - name: Cache vendored gmsh build
+        uses: actions/cache@v4
+        with:
+          path: vendor-src/gmsh/build
+          key: gmsh-build-${{ runner.os }}-${{ hashFiles('vendor-src/gmsh/**') }}
+      - name: Cache vendored ElmerSolver build
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor-src/elmer/lapack/*.a
+            vendor-src/elmer/build
+            vendor-src/elmer/install
+          key: elmer-build-${{ runner.os }}-${{ hashFiles('vendor-src/elmer/**') }}
+      - name: Build vendored gmsh + ElmerSolver
+        run: make build-solvers
+      - name: Validate ElmerSolver solves the 5-tet cube (peak w must equal 1.0e-3 m)
+        run: vendor-src/elmer/test/run.sh
+      # Tag-gated oracle tests land in Task 13 (analytic solutions driven through the real
+      # solver); zero tests match `solvers` today, so this step is a green no-op until then.
+      - name: Tag-gated solver oracle tests
+        env:
+          OBK_ELMER_BIN: ${{ github.workspace }}/vendor-src/elmer/install/bin/ElmerSolver
+          OBK_GMSH_BIN: ${{ github.workspace }}/vendor-src/gmsh/build/gmsh
+        run: go test ./... -tags solvers
+      - uses: actions/upload-artifact@v6
+        with:
+          name: solvers-linux
+          path: |
+            vendor-src/gmsh/build/gmsh
+            vendor-src/elmer/install/bin/ElmerSolver
+            vendor-src/elmer/install/bin/ElmerGrid
