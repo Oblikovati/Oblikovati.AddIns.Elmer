@@ -45,13 +45,13 @@ lib: build ## Alias for `build` (matches the M1 scaffold's smoke-test target nam
 # Build the vendored solver toolchain the engine runs at arm's length, fully from the
 # in-repo sources (no network, no system libraries):
 #   gmsh      = gmsh 4.13.1 CLI (bundled meshing engines)      -> vendor-src/gmsh/build/gmsh
-#   elmerfem  = headless ElmerSolver                           -> vendor-src/elmerfem/build/ElmerSolver
-# The requireSolver-gated tests look there (or at OBK_GMSH_BIN / OBK_ELMERSOLVER_BIN). Needs a
+#   elmer     = headless ElmerSolver                           -> vendor-src/elmer/install/bin/ElmerSolver
+# The requireSolver-gated tests look there (or at OBK_GMSH_BIN / OBK_ELMER_BIN). Needs a
 # C/C++ compiler + gfortran + cmake (build-time only). Populated by later tasks (vendor gmsh,
-# vendor elmerfem); the build.sh scripts don't exist yet in this scaffold.
+# vendor elmer); the build.sh scripts don't exist yet in this scaffold.
 build-solvers: ## Build the vendored gmsh + ElmerSolver binaries from source
 	vendor-src/gmsh/build.sh
-	vendor-src/elmerfem/build.sh
+	vendor-src/elmer/build.sh
 
 install: build ## Build then copy the library + manifest into $(ADDINS_DIR)
 	mkdir -p $(ADDINS_DIR)
