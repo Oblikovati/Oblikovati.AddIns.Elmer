@@ -1,0 +1,62 @@
+# Resolve the add-in's cross-repo deps for CI/build (ADR-0018): check out the Apache-2.0
+# contract oblikovati.org/api (by default at the version pinned in go.mod — the latest
+# PUBLISHED release the add-in tracks) and the GPL host oblikovati.org (at develop, used
+# only by the add-in<->host integration tests), inject the equivalent `replace`s the
+# committed go.mod omits, and vendor the C ABI header cgo builds include.
+#
+# Run it AFTER actions/setup-go (it shells `go mod edit`/`go list`).
+name: Resolve siblings
+description: Check out oblikovati.org/api (pinned release) + the GPL host and wire the module graph.
+
+inputs:
+  api-ref:
+    description: API git ref to check out. Default empty = the version pinned in go.mod.
+    required: false
+    default: ""
+
+outputs:
+  api-version:
+    description: The resolved api ref that was checked out.
+    value: ${{ steps.resolve.outputs.ref }}
+
+runs:
+  using: composite
+  steps:
+    - id: resolve
+      shell: bash
+      env:
+        API_REF: ${{ inputs.api-ref }}
+      run: |
+        set -euo pipefail
+        ref="$API_REF"
+        if [ -z "$ref" ]; then
+          ref=$(go mod edit -json | jq -r '.Require[]|select(.Path=="oblikovati.org/api").Version')
+        fi
+        if [ -z "$ref" ] || [ "$ref" = "null" ]; then
+          echo "siblings: could not resolve the oblikovati.org/api ref (no input, no go.mod pin)" >&2
+          exit 1
+        fi
+        echo "ref=$ref" >> "$GITHUB_OUTPUT"
+        echo "oblikovati.org/api ref: $ref"
+
+    - uses: actions/checkout@v5
+      with:
+        repository: Oblikovati/Oblikovati.API
+        ref: ${{ steps.resolve.outputs.ref }}
+        path: _api
+
+    - uses: actions/checkout@v5
+      with:
+        repository: Oblikovati/Oblikovati
+        ref: develop
+        path: _app
+
+    - shell: bash
+      run: |
+        set -euo pipefail
+        go mod edit -replace oblikovati.org/api="$GITHUB_WORKSPACE/_api"
+        go mod edit -replace oblikovati.org="$GITHUB_WORKSPACE/_app"
+        # Vendor the C ABI header so cgo builds can -I include/ (harmless for non-cgo jobs).
+        api_dir=$(go list -m -f '{{.Dir}}' oblikovati.org/api)
+        mkdir -p include
+        cp "$api_dir/include/oblikovati_addin.h" include/

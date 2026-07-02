@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # bash on every OS for consistent shell semantics (Windows' default pwsh
+    # mangles `gotestsum -- -coverprofile=...` and the inline build script).
+    shell: bash
+
+# The oblikovati-elmer add-in (module oblikovati.org/elmer). The SHIPPED c-shared
+# library links only the Apache-2.0 contract (oblikovati.org/api), pinned in go.mod to the
+# latest published API release; the GPL application module (oblikovati.org) is pulled in
+# solely by the add-in<->host integration tests. Both are sibling repos wired by the local
+# .github/actions/siblings composite (ADR-0018), which checks api out at the pinned release
+# so CI validates against exactly what ships.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
+        with:
+          version: v2.1.0
+
+  # SPDX: every Go file in this GPL repo must carry GPL-2.0-only.
+  spdx:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 scripts/add-spdx-headers.py --check
+
+  # Tier 1 — cgo-free unit + add-in<->host integration tests on every OS. The host's
+  # headless core is pure Go, so the integration tests (which drive the live
+  # router/model) run with CGO_ENABLED=0 on all three platforms.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - run: go install gotest.tools/gotestsum@v1.12.0
+      - name: Test
+        run: gotestsum --junitfile test-results-${{ matrix.os }}.xml -- -coverprofile=coverage.out -covermode=count ./elmer/... ./gplpurity/...
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: test-results-${{ matrix.os }}
+          path: test-results-${{ matrix.os }}.xml
+
+  # Race detector needs cgo; Linux only. Runs the elmer package (the root c-shared
+  # package has no tests).
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - run: go test -race ./elmer/...
+
+  # Build the SHIPPED add-in: the cgo c-shared library (.so/.dll/.dylib) on every OS.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: ./.github/actions/siblings
+      - name: Build c-shared library
+        run: |
+          EXT=so
+          [ "$RUNNER_OS" = "Windows" ] && EXT=dll
+          [ "$RUNNER_OS" = "macOS" ] && EXT=dylib
+          echo "building oblikovati-elmer.$EXT"
+          mkdir -p build
+          go build -buildmode=c-shared -o "build/oblikovati-elmer.$EXT" .
+      - uses: actions/upload-artifact@v6
+        with:
+          name: oblikovati-elmer-${{ matrix.os }}
+          path: build/oblikovati-elmer.*
+
+  # NOTE: the `solvers` job (build the vendored gmsh + ElmerSolver toolchain from source
+  # and validate each against a known case) is intentionally NOT here yet — the solver
+  # toolchain isn't vendored until Task 4 (gmsh) and Task 5 (elmerfem). Task 6 re-adds
+  # this job once vendor-src/{gmsh,elmer}/build.sh exist.
