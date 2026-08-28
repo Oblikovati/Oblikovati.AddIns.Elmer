@@ -44,3 +44,6 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Local git worktrees used for isolated feature/fix branches.
+.worktrees/
