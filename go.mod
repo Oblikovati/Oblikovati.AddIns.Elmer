@@ -10,6 +10,6 @@
 // siblings), never linked into the .so.
 module oblikovati.org/elmer
 
-go 1.24.0
+go 1.27.0
 
-require oblikovati.org/api v0.102.1
+require oblikovati.org/api v0.153.1

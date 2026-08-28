@@ -2,8 +2,8 @@
 # install it into the host's add-ins directory, which the host scans at startup.
 #
 # Its own Go toolchain: the add-in talks to the host over the C ABI, not Go, so its
-# version is independent of the host (pinned to match the head's 1.24, see go.mod).
-export GOTOOLCHAIN := go1.24.0
+# version is independent of the host (pinned to match the head's 1.27, see go.mod).
+export GOTOOLCHAIN := go1.27.0
 export CGO_ENABLED := 1
 
 OS := $(shell go env GOOS)
