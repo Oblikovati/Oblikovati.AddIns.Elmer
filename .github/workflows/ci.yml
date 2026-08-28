@@ -32,7 +32,7 @@ jobs:
       - uses: ./.github/actions/siblings
       - uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7
         with:
-          version: v2.1.0
+          version: v2.13.1
 
   # SPDX: every Go file in this GPL repo must carry GPL-2.0-only.
   spdx:
@@ -60,7 +60,7 @@ jobs:
           go-version-file: go.mod
           cache: false
       - uses: ./.github/actions/siblings
-      - run: go install gotest.tools/gotestsum@v1.12.0
+      - run: go install gotest.tools/gotestsum@v1.13.0
       - name: Test
         run: gotestsum --junitfile test-results-${{ matrix.os }}.xml -- -coverprofile=coverage.out -covermode=count ./elmer/... ./gplpurity/...
       - uses: actions/upload-artifact@v6
