@@ -51,7 +51,15 @@ runs:
     - shell: bash
       run: |
         set -euo pipefail
-        go mod edit -replace oblikovati.org/api="$GITHUB_WORKSPACE/_api"
+        api_module_dir="$GITHUB_WORKSPACE/_api"
+        if [ -f "$api_module_dir/go/go.mod" ]; then
+          api_module_dir="$api_module_dir/go"
+        fi
+        if [ ! -f "$api_module_dir/go.mod" ]; then
+          echo "siblings: expected Go module at $api_module_dir or $api_module_dir/go" >&2
+          exit 1
+        fi
+        go mod edit -replace oblikovati.org/api="$api_module_dir"
         # Vendor the C ABI header so cgo builds can -I include/ (harmless for non-cgo jobs).
         api_dir=$(go list -m -f '{{.Dir}}' oblikovati.org/api)
         mkdir -p include
