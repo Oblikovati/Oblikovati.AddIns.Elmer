@@ -5,7 +5,7 @@
   "description": "Integrates the Elmer multiphysics FEM solver: volume-meshes bodies, writes the solver input for the configured equations and boundary conditions, solves with a headless ElmerSolver, and renders the result fields back into the viewport as client graphics.",
   "license": "GPL-2.0-only",
   "sourceRepo": "https://github.com/Oblikovati/Oblikovati.AddIns.Elmer",
-  "apiCompat": "0.102",
+  "apiCompat": "0.166",
   "capabilities": [
     "commands",
     "documents",

@@ -216,3 +216,39 @@ jobs:
           path: |
             vendor-src/gmsh/build/gmsh
             vendor-src/elmer/install/
+
+  # Release the native libraries from this exact, successful main-branch CI run.
+  publish:
+    needs: [lint, spdx, test, race, build, solvers]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-api-version
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: oblikovati-elmer-*
+          path: artifacts
+      - name: Publish the API-versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api=$(awk '$1 == "oblikovati.org/api" {print $2} $1 == "require" && $2 == "oblikovati.org/api" {print $3}' go.mod)
+          [[ "$api" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          compat=${api#v}
+          test "$(jq -r .apiCompat manifest.json)" = "${compat%.*}"
+          tag="api-$api"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            exit 0
+          fi
+          gh release create "$tag" \
+            artifacts/oblikovati-elmer-ubuntu-latest/oblikovati-elmer.so \
+            artifacts/oblikovati-elmer-macos-latest/oblikovati-elmer.dylib \
+            artifacts/oblikovati-elmer-windows-latest/oblikovati-elmer.dll \
+            manifest.json --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Elmer — API $api" \
+            --notes "Native libraries built and tested against oblikovati.org/api $api."

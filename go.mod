@@ -12,4 +12,4 @@ module oblikovati.org/elmer
 
 go 1.27.0
 
-require oblikovati.org/api v0.153.1
+require oblikovati.org/api v0.166.0
