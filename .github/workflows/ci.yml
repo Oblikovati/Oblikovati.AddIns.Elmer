@@ -122,7 +122,8 @@ jobs:
   # SHIPPED add-in (the cgo c-shared library) is still validated by the `build` job on
   # all three OSes; building the vendored solver SOURCE on macOS is a follow-up.
   solvers:
-    runs-on: ubuntu-latest
+    # The vendored solvers use the GCC 13 toolchain on Ubuntu 24.04.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
